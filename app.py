@@ -47,7 +47,6 @@ def process_data(df):
 # AI Trade Signal Generator Engine
 def generate_ai_decision(df):
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
     
     price = latest['Close']
     atr = latest['ATR'] if pd.notnull(latest['ATR']) else (price * 0.02)
@@ -134,7 +133,7 @@ if symbol_input:
         st.subheader("🎯 Execution Parameters")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Optimal Entry Price", f"PKR {ai['Entry Price']}")
-        m2.metric("Upper Cap Target", f"PKR {ai['Upper Cap']}", delta=ai['Expected Gain'])
+        m2.metric("Upper Cap Target", f"PKR {ai['Upper Cap Target']}", delta=ai['Expected Gain'])
         m3.metric("Stop Loss (Strict)", f"PKR {ai['Stop Loss']}")
         m4.metric("Breakout Level", f"PKR {ai['Breakout Level']}")
 
