@@ -6,13 +6,19 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 
-st.set_page_config(page_title="PSX Quant Engine", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="PSX Quant Engine", layout="wide", page_icon="⚡")
 
-st.title("🤖 PSX Technical Signal & Quant Engine")
-st.caption("Data-Driven Trade Architecture: Wilder ADX/DI, Structural Stop Loss, Strict Pullback Engine & Multi-Panel Charts")
+# Custom Styling for Clean UI
+st.markdown("""
+    <style>
+    .big-signal-buy { font-size: 28px; font-weight: bold; color: #10B981; background-color: #ECFDF5; padding: 12px 20px; border-radius: 8px; border: 1px solid #10B981; display: inline-block; }
+    .big-signal-wait { font-size: 28px; font-weight: bold; color: #F59E0B; background-color: #FFFBEB; padding: 12px 20px; border-radius: 8px; border: 1px solid #F59E0B; display: inline-block; }
+    .big-signal-avoid { font-size: 28px; font-weight: bold; color: #EF4444; background-color: #FEF2F2; padding: 12px 20px; border-radius: 8px; border: 1px solid #EF4444; display: inline-block; }
+    </style>
+""", unsafe_allow_html=True)
 
 # ==========================================
-# 1. ROBUST INDICATOR CALCULATIONS ENGINE
+# 1. BACKEND INDICATORS CALCULATIONS ENGINE
 # ==========================================
 def process_data(df):
     if len(df) < 20:
@@ -47,13 +53,12 @@ def process_data(df):
     df['MACD_Signal'] = df['MACD_Line'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD_Line'] - df['MACD_Signal']
 
-    # E. Standard Wilder ADX Calculation
+    # E. Wilder ADX & Directional Indicators
     up_move = df['High'].diff()
     down_move = df['Low'].shift() - df['Low']
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    # Wilder Exponential Smoothing
     alpha = 1 / 14
     atr_wilder = tr.ewm(alpha=alpha, adjust=False).mean()
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr_wilder)
@@ -68,14 +73,14 @@ def process_data(df):
     df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
     df['RVOL'] = df['Volume'] / df['Vol_SMA20']
 
-    # G. Multi-Period Support & Resistance (Zero Look-Ahead Bias)
+    # G. Multi-Period Support & Resistance
     df['Resistance_20'] = df['High'].shift(1).rolling(20).max()
     df['Support_20'] = df['Low'].shift(1).rolling(20).min()
 
     return df
 
 # ==========================================
-# 2. QUANT DECISION & SETUP ENGINE
+# 2. BACKEND QUANT DECISION ENGINE
 # ==========================================
 def generate_quant_decision(df, atr_buffer_mult=0.15):
     latest = df.iloc[-1]
@@ -100,142 +105,118 @@ def generate_quant_decision(df, atr_buffer_mult=0.15):
     sma200 = latest['SMA_200']
     ema20 = latest['EMA_20']
 
-    # --- A. Trend Classification ---
+    # Trend Status
     if pd.notnull(sma20) and pd.notnull(sma50):
         if price > sma20 and sma20 >= sma50:
-            trend_status = "STRONG BULLISH"
+            trend_status = "Strong Bullish"
         elif price > sma20 and sma20 < sma50:
-            trend_status = "MODERATE BULLISH / RECOVERY"
+            trend_status = "Moderate Bullish"
         elif price < sma20 and sma20 < sma50:
-            trend_status = "BEARISH"
+            trend_status = "Bearish"
         else:
-            trend_status = "SIDEWAYS / NEUTRAL"
+            trend_status = "Neutral"
     else:
-        trend_status = "NEUTRAL"
+        trend_status = "Neutral"
 
-    # ADX Strength & Direction Status
     is_directional_bullish = plus_di > minus_di
-    if adx >= 25:
-        adx_label = f"Strong Trend (ADX={adx:.1f})"
-    elif 15 <= adx < 25:
-        adx_label = f"Moderate Trend (ADX={adx:.1f})"
-    else:
-        adx_label = f"Weak Trend (ADX={adx:.1f})"
 
-    # --- B. Breakout Engine ---
+    # Breakout Verification
     atr_buffer = atr_buffer_mult * atr
     is_price_above_res_buffer = price > (resistance + atr_buffer)
     is_vol_confirmed = rvol >= 1.2
-    is_trend_confirmed = "BULLISH" in trend_status
+    is_trend_confirmed = "Bullish" in trend_status
     is_adx_confirmed = (adx >= 20) and is_directional_bullish
     is_above_sma20 = pd.notnull(sma20) and (price > sma20)
 
-    # False Breakout vs Weak Breakout Test
     is_false_breakout = (latest['High'] > resistance) and (price < resistance)
 
     if is_price_above_res_buffer and is_vol_confirmed and is_above_sma20 and is_trend_confirmed and is_adx_confirmed:
         breakout_status = "CONFIRMED BREAKOUT"
     elif is_price_above_res_buffer and not is_vol_confirmed:
-        breakout_status = "WEAK BREAKOUT / WAIT"
+        breakout_status = "WEAK BREAKOUT"
     elif price >= resistance and (rvol >= 1.0 or adx >= 20):
-        breakout_status = "BREAKOUT READY / WATCH"
+        breakout_status = "BREAKOUT READY"
     elif is_false_breakout:
         breakout_status = "FALSE BREAKOUT RISK"
-    elif latest['High'] >= resistance or price >= resistance:
-        breakout_status = "TESTING RESISTANCE"
     else:
         breakout_status = "NO BREAKOUT"
 
-    # --- C. Strict Pullback Engine ---
+    # Pullback Verification
     near_support_zone = (pd.notnull(ema20) and abs(price - ema20) / price <= 0.018) or (abs(price - support) / price <= 0.02)
     is_rejection_bounce = (latest['Close'] > latest['Open']) or (price > float(prev['Low']))
     macd_not_deteriorating = latest['MACD_Hist'] >= prev['MACD_Hist']
 
     reasons = []
 
-    if breakout_status in ["CONFIRMED BREAKOUT", "BREAKOUT READY / WATCH"]:
+    if breakout_status in ["CONFIRMED BREAKOUT", "BREAKOUT READY"]:
         setup_type = "BREAKOUT"
-        reasons.append(f"Price holding above 20D Resistance ({resistance:.2f}) with ATR buffer ({atr_buffer:.2f}).")
-        reasons.append(f"RVOL ({rvol:.2f}x) and +DI ({plus_di:.1f}) > -DI ({minus_di:.1f}) confirm bullish momentum.")
+        main_signal = "BUY"
+        reasons.append(f"Strong price breakout above resistance level ({resistance:.2f}).")
+        reasons.append(f"High volume ({rvol:.1f}x normal) and momentum support the move.")
     elif is_trend_confirmed and near_support_zone and is_rejection_bounce and rsi <= 58 and macd_not_deteriorating:
         setup_type = "PULLBACK"
-        reasons.append(f"Stock in primary uptrend pulled back to key zone near EMA20/Support ({support:.2f}).")
-        reasons.append(f"Price bounce confirmation with healthy RSI ({rsi:.1f}) offers favorable risk profile.")
+        main_signal = "BUY"
+        reasons.append(f"Price pulled back to key support ({support:.2f}) in a primary uptrend.")
+        reasons.append("Recent candle shows price bounce/recovery confirmation.")
     elif is_trend_confirmed and latest['MACD_Hist'] > 0 and rvol > 1.0 and is_directional_bullish:
         setup_type = "MOMENTUM"
-        reasons.append("MACD Histogram expanding with price trading above key short-term EMAs.")
-        reasons.append("Directional Index (+DI > -DI) supports trend continuation.")
+        main_signal = "BUY"
+        reasons.append("Positive momentum with increasing volume above key moving averages.")
     else:
-        setup_type = "NO TRADE"
+        setup_type = "NO SETUP"
         if is_false_breakout:
-            reasons.append(f"False Breakout Warning: Intraday high reached {latest['High']:.2f} but price closed below resistance.")
-        elif breakout_status == "WEAK BREAKOUT / WAIT":
-            reasons.append(f"Weak Breakout: Price crossed resistance but lacks Volume ({rvol:.2f}x < 1.2x) or ADX confirmation.")
+            main_signal = "AVOID"
+            reasons.append("False Breakout Risk: Price crossed resistance intraday but closed below it.")
+        elif breakout_status == "WEAK BREAKOUT":
+            main_signal = "WAIT"
+            reasons.append("Weak Breakout: Price crossed resistance but lacks volume confirmation.")
+        elif "Bearish" in trend_status:
+            main_signal = "AVOID"
+            reasons.append("Stock is in a downtrend. Avoid buying against the overall trend.")
         else:
-            reasons.append("Structure lacks high-probability breakout or pullback confirmation at current levels.")
+            main_signal = "WAIT"
+            reasons.append("Market is consolidating. No low-risk buy entry confirmed right now.")
 
-    # --- D. Conditional Entry, Target & Structural Stop Loss ---
+    # Conditional Execution Levels
     if setup_type == "BREAKOUT":
         conditional_buy = round(max(resistance, pdh) + atr_buffer, 2)
-        # Structural SL below broken resistance
         stop_loss = round(resistance - (0.8 * atr), 2)
         target1 = round(conditional_buy + (1.5 * atr), 2)
         target2 = round(conditional_buy + (3.0 * atr), 2)
-        next_bias = "BULLISH"
-        condition_msg = f"BUY ABOVE PKR {conditional_buy} ONLY IF BREAKOUT CONFIRMED WITH VOLUME"
-
     elif setup_type == "PULLBACK":
         conditional_buy = round(price + (0.2 * atr), 2)
-        # Structural SL below nearest key support / EMA20
         structural_support = min(ema20, support) if pd.notnull(ema20) else support
         stop_loss = round(structural_support - (0.5 * atr), 2)
         target1 = round(conditional_buy + (1.8 * atr), 2)
         target2 = round(conditional_buy + (3.2 * atr), 2)
-        next_bias = "BULLISH"
-        condition_msg = f"BUY ABOVE PKR {conditional_buy} ON RECOVERY BOUNCE CONFIRMATION"
-
     elif setup_type == "MOMENTUM":
         conditional_buy = round(pdh + atr_buffer, 2)
         stop_loss = round(price - (1.2 * atr), 2)
         target1 = round(conditional_buy + (1.5 * atr), 2)
         target2 = round(conditional_buy + (2.8 * atr), 2)
-        next_bias = "BULLISH"
-        condition_msg = f"BUY ABOVE PKR {conditional_buy} IF MOMENTUM CONTINUES"
-
     else:
         conditional_buy = round(pdh + atr_buffer, 2)
         stop_loss = round(price - (1.5 * atr), 2)
         target1 = round(price + (1.5 * atr), 2)
         target2 = round(price + (2.5 * atr), 2)
-        next_bias = "NEUTRAL / BEARISH" if is_false_breakout else "NEUTRAL"
-        condition_msg = "WAIT / AVOID — NO CLEAR CONDITIONAL TRIGGER"
 
-    # Enforce SL strictly below Conditional Buy
+    # Enforce SL below Conditional Buy
     if stop_loss >= conditional_buy:
         stop_loss = round(conditional_buy - (1.2 * atr), 2)
 
-    # Risk / Reward Filters & Quality Rating
+    # Risk / Reward Filter
     risk_per_share = max(conditional_buy - stop_loss, 0.01)
     rr_target1 = round((target1 - conditional_buy) / risk_per_share, 2)
     rr_target2 = round((target2 - conditional_buy) / risk_per_share, 2)
 
-    if rr_target1 < 1.5:
-        setup_quality = "POOR (R:R < 1.5) — WAIT"
-        if setup_type != "NO TRADE":
-            condition_msg = "WAIT / AVOID — RISK/REWARD UNATTRACTIVE (< 1:1.5)"
-            reasons.append("Trade invalidated due to unattractive Risk-to-Reward ratio on Target 1.")
-    elif setup_type in ["BREAKOUT", "PULLBACK"] and rvol >= 1.2:
-        setup_quality = "HIGH QUALITY"
-    elif setup_type != "NO TRADE":
-        setup_quality = "MODERATE QUALITY"
-    else:
-        setup_quality = "NO SETUP"
+    if rr_target1 < 1.5 and main_signal == "BUY":
+        main_signal = "WAIT"
+        reasons.append("Trade invalidated because Risk-to-Reward ratio is below 1:1.5.")
 
-    # --- E. Transparent Technical Score Breakdown ---
+    # Technical Score Factors for Advanced Section
     score = 0
     factors = []
-
-    if "BULLISH" in trend_status:
+    if "Bullish" in trend_status:
         score += 25
         factors.append({"Factor": "Trend Alignment", "Points": "+25", "Details": trend_status})
     else:
@@ -243,30 +224,27 @@ def generate_quant_decision(df, atr_buffer_mult=0.15):
 
     if is_adx_confirmed:
         score += 15
-        factors.append({"Factor": "ADX & +DI Alignment", "Points": "+15", "Details": f"{adx_label}, +DI > -DI"})
+        factors.append({"Factor": "ADX Strength", "Points": "+15", "Details": f"ADX={adx:.1f}, +DI > -DI"})
     else:
-        factors.append({"Factor": "ADX & +DI Alignment", "Points": "+0", "Details": f"{adx_label}"})
+        factors.append({"Factor": "ADX Strength", "Points": "+0", "Details": f"ADX={adx:.1f}"})
 
     if latest['MACD_Line'] > latest['MACD_Signal']:
         score += 20
-        factors.append({"Factor": "MACD Indicator", "Points": "+20", "Details": "Bullish Crossover"})
+        factors.append({"Factor": "MACD Crossover", "Points": "+20", "Details": "Bullish"})
     else:
-        factors.append({"Factor": "MACD Indicator", "Points": "+0", "Details": "Bearish / Neutral"})
+        factors.append({"Factor": "MACD Crossover", "Points": "+0", "Details": "Bearish / Neutral"})
 
     if rvol >= 1.2:
         score += 20
-        factors.append({"Factor": "Relative Volume", "Points": "+20", "Details": f"High RVOL ({rvol:.2f}x)"})
+        factors.append({"Factor": "Volume Surge", "Points": "+20", "Details": f"{rvol:.1f}x Volume"})
     else:
-        factors.append({"Factor": "Relative Volume", "Points": "+0", "Details": f"Normal RVOL ({rvol:.2f}x)"})
+        factors.append({"Factor": "Volume Surge", "Points": "+0", "Details": f"{rvol:.1f}x Volume"})
 
     if 40 <= rsi <= 65:
         score += 20
-        factors.append({"Factor": "RSI Quality", "Points": "+20", "Details": f"Healthy ({rsi:.1f})"})
-    elif rsi < 40:
-        score += 10
-        factors.append({"Factor": "RSI Quality", "Points": "+10", "Details": f"Oversold ({rsi:.1f})"})
+        factors.append({"Factor": "RSI Level", "Points": "+20", "Details": f"Healthy ({rsi:.1f})"})
     else:
-        factors.append({"Factor": "RSI Quality", "Points": "+0", "Details": f"Overbought ({rsi:.1f})"})
+        factors.append({"Factor": "RSI Level", "Points": "+0", "Details": f"Extreme ({rsi:.1f})"})
 
     return {
         "Price": price,
@@ -276,189 +254,153 @@ def generate_quant_decision(df, atr_buffer_mult=0.15):
         "Resistance": resistance,
         "Support": support,
         "RVOL": rvol,
-        "ADX Label": adx_label,
-        "Plus DI": plus_di,
-        "Minus DI": minus_di,
+        "RSI": rsi,
+        "ADX": adx,
+        "Plus_DI": plus_di,
+        "Minus_DI": minus_di,
+        "SMA20": sma20,
+        "SMA50": sma50,
         "SMA200": sma200,
+        "EMA9": latest['EMA_9'],
+        "EMA20": ema20,
+        "MACD_Line": latest['MACD_Line'],
+        "MACD_Signal": latest['MACD_Signal'],
+        "MACD_Hist": latest['MACD_Hist'],
         "Trend Status": trend_status,
-        "Breakout Status": breakout_status,
+        "Main Signal": main_signal,
         "Setup Type": setup_type,
-        "Setup Quality": setup_quality,
-        "Next Bias": next_bias,
         "Technical Score": score,
-        "Conditional Buy Above": conditional_buy,
+        "Conditional Buy": conditional_buy,
         "Stop Loss": stop_loss,
         "Target 1": target1,
         "Target 2": target2,
         "RR Target 1": rr_target1,
         "RR Target 2": rr_target2,
-        "Condition Msg": condition_msg,
         "Reasons": reasons,
         "Factors": factors,
         "Risk Per Share": risk_per_share
     }
 
 # ==========================================
-# 3. STREAMLIT USER INTERFACE & LAYOUT
+# 3. CLEAN & SIMPLE STREAMLIT INTERFACE
 # ==========================================
-st.sidebar.header("⚙️ Parameters & Position Sizing")
-symbol_input = st.sidebar.text_input("Enter PSX Ticker", value="SYS").strip().upper()
-period_choice = st.sidebar.selectbox("History Period", ["3mo", "6mo", "1y", "2y"], index=2)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("💰 Risk & Position Sizing")
-trading_capital = st.sidebar.number_input("Trading Capital (PKR)", value=100000, step=10000)
+st.sidebar.header("🔍 Stock & Account Setup")
+symbol_input = st.sidebar.text_input("PSX Ticker", value="SYS").strip().upper()
+trading_capital = st.sidebar.number_input("Capital (PKR)", value=100000, step=10000)
 risk_pct = st.sidebar.number_input("Risk Per Trade (%)", value=1.0, step=0.25, max_value=5.0)
-max_allocation_pct = st.sidebar.number_input("Max Capital Allocation (%)", value=25.0, step=5.0, max_value=100.0)
 
 if symbol_input:
-    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S PKT")
-    data = yf.Ticker(f"{symbol_input}.KA").history(period=period_choice)
+    data = yf.Ticker(f"{symbol_input}.KA").history(period="1y")
     
     if data.empty or len(data) < 20:
-        st.error(f"⚠️ Insufficient data for '{symbol_input}'. Minimum 20 trading sessions required.")
+        st.error(f"⚠️ Insufficient data for '{symbol_input}'. Please check the ticker.")
     else:
-        if len(data) < 50:
-            st.warning(f"⚠️ **Limited Data Warning:** Only {len(data)} rows loaded. Standard calculations require more history.")
-        
         df = process_data(data)
         q = generate_quant_decision(df)
 
-        last_data_date = df.index[-1].strftime("%Y-%m-%d")
-        days_diff = (datetime.now() - df.index[-1].tz_localize(None)).days
+        # 1. STOCK / CURRENT PRICE
+        top_col1, top_col2 = st.columns([2, 1])
+        with top_col1:
+            st.title(f"{symbol_input} — PKR {q['Price']:.2f}")
+            change = q['Price'] - q['Prev Close']
+            change_pct = (change / q['Prev Close']) * 100
+            st.caption(f"Previous Close: PKR {q['Prev Close']:.2f} | Change: {change:+.2f} ({change_pct:+.2f}%)")
 
-        if days_diff > 3:
-            st.warning(
-                f"⚠️ **Data Currency Alert:** Market data last updated on **{last_data_date}** ({days_diff} days old). "
-                "Verify session status before placing conditional orders."
-            )
-
-        if q['Breakout Status'] == "FALSE BREAKOUT RISK":
-            st.error("🚨 **FALSE BREAKOUT RISK:** Price tested resistance intraday but failed to close above it. High probability of bull trap!")
-
-        # --- EXECUTIVE DASHBOARD HEADER ---
-        st.markdown(f"### Conditional Next-Session Setup: **:{'green' if q['Next Bias'] == 'BULLISH' else 'orange' if q['Next Bias'] == 'NEUTRAL' else 'red'}[{q['Setup Type']} — {q['Next Bias']}]**")
-        st.info(f"📋 **Conditional Trigger Rule:** {q['Condition Msg']}")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Technical Score", f"{q['Technical Score']} / 100")
-        c2.metric("Setup Quality", q['Setup Quality'])
-        c3.metric("Breakout Status", q['Breakout Status'])
-        c4.metric("Trend Classification", q['Trend Status'])
-
-        if q['Technical Score'] >= 75 and "POOR" in q['Setup Quality']:
-            st.caption("ℹ️ **Engine Audit Note:** Strong technical trend, but current entry has poor Risk-to-Reward. Waiting for pullback or confirmed breakout buffer.")
+        # 2. MAIN SIGNAL
+        with top_col2:
+            st.write("### ")
+            if q['Main Signal'] == "BUY":
+                st.markdown(f'<div class="big-signal-buy">🟢 SIGNAL: BUY ({q["Setup Type"]})</div>', unsafe_allow_html=True)
+            elif q['Main Signal'] == "WAIT":
+                st.markdown('<div class="big-signal-wait">🟡 SIGNAL: WAIT</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="big-signal-avoid">🔴 SIGNAL: AVOID</div>', unsafe_allow_html=True)
 
         st.markdown("---")
 
-        # --- CONDITIONAL EXECUTION PARAMETERS ---
-        st.subheader("🎯 Conditional Next-Session Execution Parameters")
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Conditional Buy Above", f"PKR {q['Conditional Buy Above']}")
-        m2.metric("Stop Loss (Strict)", f"PKR {q['Stop Loss']}")
-        m3.metric("Target 1", f"PKR {q['Target 1']}", delta=f"1 : {q['RR Target 1']} R:R")
-        m4.metric("Target 2", f"PKR {q['Target 2']}", delta=f"1 : {q['RR Target 2']} R:R")
-        m5.metric("Relative Vol (RVOL)", f"{q['RVOL']:.2f}x")
+        # 3. SIMPLE REASON FOR SIGNAL & 4. TRADE PLAN
+        col_reason, col_plan = st.columns([1, 1])
 
-        st.markdown("---")
-
-        # --- POSITION SIZING & RISK ALLOCATION ---
-        st.subheader("🧮 Position Sizing & Allocation Management")
-        max_rupee_risk = (trading_capital * risk_pct) / 100.0
-        max_capital_allowed = (trading_capital * max_allocation_pct) / 100.0
-
-        qty_by_risk = int(max_rupee_risk / q['Risk Per Share']) if q['Risk Per Share'] > 0 else 0
-        qty_by_cap = int(max_capital_allowed / q['Conditional Buy Above']) if q['Conditional Buy Above'] > 0 else 0
-        
-        final_qty = min(qty_by_risk, qty_by_cap)
-        position_val = round(final_qty * q['Conditional Buy Above'], 2)
-        actual_rupee_risk = round(final_qty * q['Risk Per Share'], 2)
-        actual_risk_pct = round((actual_rupee_risk / trading_capital) * 100, 2) if trading_capital > 0 else 0.0
-
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Max Rupee Risk", f"PKR {max_rupee_risk:,.2f}")
-        p2.metric("Risk Per Share", f"PKR {q['Risk Per Share']:.2f}")
-        p3.metric("Allowed Shares", f"{final_qty:,}")
-        p4.metric("Position Value", f"PKR {position_val:,.2f}")
-        p5.metric("Actual Risk %", f"{actual_risk_pct}% ({actual_rupee_risk:,.0f} PKR)")
-
-        st.markdown("---")
-
-        # --- MARKET LEVELS & THESIS ---
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            st.subheader("📊 Key Market Levels")
-            sma200_str = f"{q['SMA200']:.2f}" if pd.notnull(q['SMA200']) else "Insufficient History"
-            
-            levels_df = pd.DataFrame([
-                {"Level": "Current Close Price", "Value (PKR)": f"{q['Price']:.2f}"},
-                {"Level": "Previous Close", "Value (PKR)": f"{q['Prev Close']:.2f}"},
-                {"Level": "Previous Day High (PDH)", "Value (PKR)": f"{q['PDH']:.2f}"},
-                {"Level": "Previous Day Low (PDL)", "Value (PKR)": f"{q['PDL']:.2f}"},
-                {"Level": "20-Day Resistance", "Value (PKR)": f"{q['Resistance']:.2f}"},
-                {"Level": "20-Day Support", "Value (PKR)": f"{q['Support']:.2f}"},
-                {"Level": "200-Day SMA", "Value (PKR)": sma200_str},
-            ])
-            st.table(levels_df)
-
-        with col_right:
-            st.subheader("💡 Technical Trade Thesis")
+        with col_reason:
+            st.subheader("💡 Why this Signal?")
             for idx, r in enumerate(q['Reasons'], 1):
                 st.write(f"**{idx}.** {r}")
+
+        with col_plan:
+            st.subheader("🎯 Trade Plan")
+            tp1, tp2 = st.columns(2)
+            tp1.metric("Conditional Buy Above", f"PKR {q['Conditional Buy']:.2f}")
+            tp2.metric("Stop Loss", f"PKR {q['Stop Loss']:.2f}")
             
-            with st.expander("🔍 **View Factor Score Audit**"):
-                st.table(pd.DataFrame(q['Factors']))
+            tp3, tp4, tp5 = st.columns(3)
+            tp3.metric("Target 1", f"PKR {q['Target 1']:.2f}")
+            tp4.metric("Target 2", f"PKR {q['Target 2']:.2f}")
+            tp5.metric("Risk / Reward", f"1 : {q['RR Target 1']}")
 
-        # --- MULTI-PANEL PLOTLY CHART ---
         st.markdown("---")
-        st.subheader("📈 Multi-Indicator Technical Chart Engine")
+
+        # 5. MARKET STATUS & 6. POSITION SIZE
+        col_status, col_pos = st.columns([1, 1])
+
+        with col_status:
+            st.subheader("📊 Market Status")
+            ms1, ms2 = st.columns(2)
+            ms1.metric("Trend", q['Trend Status'])
+            ms2.metric("Volume", "High Volume" if q['RVOL'] >= 1.2 else "Normal Volume")
+            
+            ms3, ms4 = st.columns(2)
+            ms3.metric("Support", f"PKR {q['Support']:.2f}")
+            ms4.metric("Resistance", f"PKR {q['Resistance']:.2f}")
+
+        with col_pos:
+            st.subheader("🧮 Position Size")
+            max_rupee_risk = (trading_capital * risk_pct) / 100.0
+            qty = int(max_rupee_risk / q['Risk Per Share']) if q['Risk Per Share'] > 0 else 0
+            investment = qty * q['Conditional Buy']
+
+            ps1, ps2, ps3 = st.columns(3)
+            ps1.metric("Shares to Buy", f"{qty:,}")
+            ps2.metric("Investment Value", f"PKR {investment:,.0f}")
+            ps3.metric("Max Loss Risk", f"PKR {max_rupee_risk:,.0f}")
+
+        st.markdown("---")
+
+        # 7. ONE CLEAN PRICE CHART
+        st.subheader("📈 Price Chart")
         
-        fig = make_subplots(
-            rows=4, cols=1, 
-            shared_xaxes=True, 
-            row_heights=[0.45, 0.20, 0.18, 0.17], 
-            vertical_spacing=0.03,
-            subplot_titles=(
-                "Price, SMAs, EMAs & Support/Resistance", 
-                "MACD Indicator (Line, Signal, Histogram)", 
-                "Standard Wilder ADX & Directional Indicators (+DI / -DI)",
-                "Volume & 20-Period Volume SMA (RVOL)"
-            )
-        )
-
-        # Panel 1: Price & Overlay Indicators
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], mode='lines', name='SMA 20', line=dict(color='blue', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='SMA 50', line=dict(color='orange', width=1)), row=1, col=1)
-        if pd.notnull(q['SMA200']):
-            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], mode='lines', name='SMA 200', line=dict(color='purple', width=1.5)), row=1, col=1)
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"
+        ))
         
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_9'], mode='lines', name='EMA 9', line=dict(color='cyan', width=1, dash='dot')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'], mode='lines', name='EMA 20', line=dict(color='magenta', width=1, dash='dot')), row=1, col=1)
+        # Overlay Only Essential Levels for Simplicity
+        fig.add_trace(go.Scatter(x=df.index, y=df['Resistance_20'], mode='lines', name='Resistance', line=dict(color='red', dash='dash')))
+        fig.add_trace(go.Scatter(x=df.index, y=df['Support_20'], mode='lines', name='Support', line=dict(color='green', dash='dash')))
         
-        fig.add_trace(go.Scatter(x=df.index, y=df['Resistance_20'], mode='lines', name='20D Resistance', line=dict(color='red', dash='dash', width=1.2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Support_20'], mode='lines', name='20D Support', line=dict(color='green', dash='dash', width=1.2)), row=1, col=1)
+        # Highlight Entry and SL
+        if q['Main Signal'] == "BUY":
+            fig.add_hline(y=q['Conditional Buy'], line_color="blue", line_dash="dot", annotation_text="Buy Above")
+            fig.add_hline(y=q['Stop Loss'], line_color="red", line_dash="dot", annotation_text="Stop Loss")
 
-        # PDH / PDL Horizontal Markers on Latest Candle
-        fig.add_hline(y=q['PDH'], line_dash="dot", line_color="darkred", annotation_text="PDH", row=1, col=1)
-        fig.add_hline(y=q['PDL'], line_dash="dot", line_color="darkgreen", annotation_text="PDL", row=1, col=1)
-
-        # Panel 2: MACD
-        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Line'], mode='lines', name='MACD', line=dict(color='blue')), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_Signal'], mode='lines', name='Signal', line=dict(color='orange')), row=2, col=1)
-        colors_hist = ['green' if val >= 0 else 'red' for val in df['MACD_Hist']]
-        fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], name='Histogram', marker_color=colors_hist), row=2, col=1)
-
-        # Panel 3: Standard ADX & +DI/-DI
-        fig.add_trace(go.Scatter(x=df.index, y=df['ADX'], mode='lines', name='ADX', line=dict(color='black', width=1.5)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Plus_DI'], mode='lines', name='+DI', line=dict(color='green', width=1)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Minus_DI'], mode='lines', name='-DI', line=dict(color='red', width=1)), row=3, col=1)
-
-        # Panel 4: Volume & RVOL
-        colors_vol = ['green' if df['Close'].iloc[i] >= df['Open'].iloc[i] else 'red' for i in range(len(df))]
-        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volume", marker_color=colors_vol), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['Vol_SMA20'], mode='lines', name='20D Vol SMA', line=dict(color='black', width=1)), row=4, col=1)
-
-        fig.update_layout(height=850, xaxis_rangeslider_visible=False, template="plotly_white")
+        fig.update_layout(height=450, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
+
+        # EXPANDABLE SECTION FOR DETAILED TECHNICAL DATA
+        with st.expander("🔬 Advanced Technical Analysis"):
+            st.write("#### Technical Score Breakdown")
+            st.metric("Overall Score", f"{q['Technical Score']} / 100")
+            st.table(pd.DataFrame(q['Factors']))
+
+            st.markdown("---")
+            st.write("#### Detailed Indicator Metrics")
+            ind1, ind2, ind3, ind4 = st.columns(4)
+            ind1.metric("RSI (14)", f"{q['RSI']:.1f}")
+            ind2.metric("ADX", f"{q['ADX']:.1f}")
+            ind3.metric("+DI / -DI", f"{q['Plus_DI']:.1f} / {q['Minus_DI']:.1f}")
+            ind4.metric("RVOL", f"{q['RVOL']:.2f}x")
+
+            ind5, ind6, ind7, ind8 = st.columns(4)
+            ind5.metric("SMA 20", f"{q['SMA20']:.2f}" if pd.notnull(q['SMA20']) else "N/A")
+            ind6.metric("SMA 50", f"{q['SMA50']:.2f}" if pd.notnull(q['SMA50']) else "N/A")
+            ind7.metric("EMA 20", f"{q['EMA20']:.2f}" if pd.notnull(q['EMA20']) else "N/A")
+            ind8.metric("MACD Hist", f"{q['MACD_Hist']:.2f}")
