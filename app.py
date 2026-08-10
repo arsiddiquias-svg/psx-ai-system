@@ -3,22 +3,23 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime
 
 st.set_page_config(page_title="PSX Quant Engine", layout="wide", page_icon="⚡")
 
-# Custom Styling for Clean UI
+# Custom CSS for UI Polish
 st.markdown("""
     <style>
-    .big-signal-buy { font-size: 28px; font-weight: bold; color: #10B981; background-color: #ECFDF5; padding: 12px 20px; border-radius: 8px; border: 1px solid #10B981; display: inline-block; }
-    .big-signal-wait { font-size: 28px; font-weight: bold; color: #F59E0B; background-color: #FFFBEB; padding: 12px 20px; border-radius: 8px; border: 1px solid #F59E0B; display: inline-block; }
-    .big-signal-avoid { font-size: 28px; font-weight: bold; color: #EF4444; background-color: #FEF2F2; padding: 12px 20px; border-radius: 8px; border: 1px solid #EF4444; display: inline-block; }
+    .ticker-header { font-size: 26px; font-weight: 700; color: #1E293B; margin-bottom: 0px; }
+    .price-subhead { font-size: 14px; color: #64748B; margin-bottom: 15px; }
+    .big-signal-buy { font-size: 22px; font-weight: bold; color: #10B981; background-color: #ECFDF5; padding: 10px 18px; border-radius: 8px; border: 1px solid #10B981; text-align: center; }
+    .big-signal-wait { font-size: 22px; font-weight: bold; color: #F59E0B; background-color: #FFFBEB; padding: 10px 18px; border-radius: 8px; border: 1px solid #F59E0B; text-align: center; }
+    .big-signal-avoid { font-size: 22px; font-weight: bold; color: #EF4444; background-color: #FEF2F2; padding: 10px 18px; border-radius: 8px; border: 1px solid #EF4444; text-align: center; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. BACKEND INDICATORS CALCULATIONS ENGINE
+# 1. UNTOUCHED BACKEND CALCULATIONS ENGINE
 # ==========================================
 def process_data(df):
     if len(df) < 20:
@@ -80,7 +81,7 @@ def process_data(df):
     return df
 
 # ==========================================
-# 2. BACKEND QUANT DECISION ENGINE
+# 2. UNTOUCHED QUANT DECISION ENGINE
 # ==========================================
 def generate_quant_decision(df, atr_buffer_mult=0.15):
     latest = df.iloc[-1]
@@ -282,7 +283,7 @@ def generate_quant_decision(df, atr_buffer_mult=0.15):
     }
 
 # ==========================================
-# 3. CLEAN & SIMPLE STREAMLIT INTERFACE
+# 3. POLISHED STREAMLIT USER INTERFACE
 # ==========================================
 st.sidebar.header("🔍 Stock & Account Setup")
 symbol_input = st.sidebar.text_input("PSX Ticker", value="SYS").strip().upper()
@@ -298,17 +299,16 @@ if symbol_input:
         df = process_data(data)
         q = generate_quant_decision(df)
 
-        # 1. STOCK / CURRENT PRICE
-        top_col1, top_col2 = st.columns([2, 1])
+        # 1. STOCK / CURRENT PRICE (Polished Heading Size)
+        top_col1, top_col2 = st.columns([2.5, 1.5])
         with top_col1:
-            st.title(f"{symbol_input} — PKR {q['Price']:.2f}")
+            st.markdown(f'<div class="ticker-header">{symbol_input} — PKR {q["Price"]:.2f}</div>', unsafe_allow_html=True)
             change = q['Price'] - q['Prev Close']
             change_pct = (change / q['Prev Close']) * 100
-            st.caption(f"Previous Close: PKR {q['Prev Close']:.2f} | Change: {change:+.2f} ({change_pct:+.2f}%)")
+            st.markdown(f'<div class="price-subhead">Prev Close: PKR {q["Prev Close"]:.2f} | Change: {change:+.2f} ({change_pct:+.2f}%)</div>', unsafe_allow_html=True)
 
         # 2. MAIN SIGNAL
         with top_col2:
-            st.write("### ")
             if q['Main Signal'] == "BUY":
                 st.markdown(f'<div class="big-signal-buy">🟢 SIGNAL: BUY ({q["Setup Type"]})</div>', unsafe_allow_html=True)
             elif q['Main Signal'] == "WAIT":
@@ -365,28 +365,42 @@ if symbol_input:
 
         st.markdown("---")
 
-        # 7. ONE CLEAN PRICE CHART
+        # 7. ONE COMPACT & CLEAN PRICE CHART
         st.subheader("📈 Price Chart")
         
         fig = go.Figure()
+
+        # Candlestick Trace
         fig.add_trace(go.Candlestick(
             x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"
         ))
         
-        # Overlay Only Essential Levels for Simplicity
-        fig.add_trace(go.Scatter(x=df.index, y=df['Resistance_20'], mode='lines', name='Resistance', line=dict(color='red', dash='dash')))
-        fig.add_trace(go.Scatter(x=df.index, y=df['Support_20'], mode='lines', name='Support', line=dict(color='green', dash='dash')))
+        # Structural Levels
+        fig.add_trace(go.Scatter(x=df.index, y=df['Resistance_20'], mode='lines', name='Resistance', line=dict(color='red', dash='dash', width=1.2)))
+        fig.add_trace(go.Scatter(x=df.index, y=df['Support_20'], mode='lines', name='Support', line=dict(color='green', dash='dash', width=1.2)))
         
-        # Highlight Entry and SL
-        if q['Main Signal'] == "BUY":
-            fig.add_hline(y=q['Conditional Buy'], line_color="blue", line_dash="dot", annotation_text="Buy Above")
-            fig.add_hline(y=q['Stop Loss'], line_color="red", line_dash="dot", annotation_text="Stop Loss")
+        # Current Price Highlight Line
+        fig.add_hline(y=q['Price'], line_color="#0284C7", line_dash="dot", line_width=1.5, annotation_text=f"Current: {q['Price']:.2f}", annotation_position="top right")
 
-        fig.update_layout(height=450, xaxis_rangeslider_visible=False, template="plotly_white", margin=dict(l=20, r=20, t=20, b=20))
+        # Trade Plan Levels Highlighted Only When Relevant
+        if q['Main Signal'] == "BUY":
+            fig.add_hline(y=q['Conditional Buy'], line_color="#2563EB", line_dash="solid", line_width=1.5, annotation_text=f"Buy Above: {q['Conditional Buy']:.2f}", annotation_position="bottom right")
+            fig.add_hline(y=q['Stop Loss'], line_color="#DC2626", line_dash="solid", line_width=1.5, annotation_text=f"SL: {q['Stop Loss']:.2f}", annotation_position="bottom right")
+            fig.add_hline(y=q['Target 1'], line_color="#16A34A", line_dash="dashdot", line_width=1.2, annotation_text=f"T1: {q['Target 1']:.2f}", annotation_position="top right")
+            fig.add_hline(y=q['Target 2'], line_color="#059669", line_dash="dashdot", line_width=1.2, annotation_text=f"T2: {q['Target 2']:.2f}", annotation_position="top right")
+
+        # Compact Height & Clean Padding Layout
+        fig.update_layout(
+            height=380,
+            xaxis_rangeslider_visible=False,
+            template="plotly_white",
+            margin=dict(l=10, r=10, t=25, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # EXPANDABLE SECTION FOR DETAILED TECHNICAL DATA
-        with st.expander("🔬 Advanced Technical Analysis"):
+        # ADVANCED TECHNICAL ANALYSIS (Collapsed Expander)
+        with st.expander("🔬 Advanced Technical Analysis", expanded=False):
             st.write("#### Technical Score Breakdown")
             st.metric("Overall Score", f"{q['Technical Score']} / 100")
             st.table(pd.DataFrame(q['Factors']))
