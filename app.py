@@ -223,7 +223,11 @@ def min_history_ok(d, needed=210):
 # SECTION: MARKET REGIME
 # ============================================================
 
+@st.cache_data(ttl=300, show_spinner=False)
 def market_regime():
+    # Cached: without this, analyze_stock() (called once per ticker in the
+    # screener/portfolio loops) was recomputing the same index-level SMA
+    # calculation dozens of times per run.
     idx_df, label = fetch_market_index()
     if idx_df is None or len(idx_df) < 60:
         return "UNAVAILABLE", None, "Market index data unavailable from provider."
@@ -312,19 +316,31 @@ def trend_engine(d):
 # ============================================================
 
 def support_resistance(d):
-    recent20 = d.tail(20)
-    recent60 = d.tail(60) if len(d) >= 60 else d
+    # IMPORTANT: exclude the current (last) candle from the lookback window.
+    # Including today's own high/low made resistance/support self-referential -
+    # a stock's close could almost never exceed a "resistance" that already
+    # baked in today's own high, so breakouts rarely triggered correctly.
+    history = d.iloc[:-1] if len(d) > 1 else d
+
+    recent20 = history.tail(20) if len(history) >= 20 else history
+    recent60 = history.tail(60) if len(history) >= 60 else history
 
     primary_resistance = recent20["High"].max()
     primary_support = recent20["Low"].min()
     secondary_resistance = recent60["High"].max()
     secondary_support = recent60["Low"].min()
 
+    last = d.iloc[-1]
+    high_52w = last.get("52W_HIGH", np.nan)
+    low_52w = last.get("52W_LOW", np.nan)
+
     return {
         "primary_support": primary_support,
         "primary_resistance": primary_resistance,
         "secondary_support": secondary_support,
         "secondary_resistance": secondary_resistance,
+        "high_52w": high_52w if not pd.isna(high_52w) else secondary_resistance,
+        "low_52w": low_52w if not pd.isna(low_52w) else secondary_support,
     }
 
 
@@ -341,21 +357,28 @@ def breakout_engine(d, sr, vol_ratio_threshold=1.5):
 
     was_below = prev["Close"] <= resistance
     now_above = price > resistance
+    fresh_cross = now_above and was_below  # today is the actual breakout session
     volume_confirmed = vol_ratio >= vol_ratio_threshold
     momentum_positive = last["MACD_HIST"] > 0
 
     distance_pct = (resistance - price) / price * 100 if price else None
+    near_52w_high = (not pd.isna(sr["high_52w"])) and price >= sr["high_52w"] * 0.98
 
-    if now_above and volume_confirmed and momentum_positive:
+    if now_above and volume_confirmed and momentum_positive and fresh_cross:
         status = "BREAKOUT CONFIRMED"
+    elif now_above and volume_confirmed and momentum_positive and not fresh_cross:
+        status = "BREAKOUT CONFIRMED (extended - already broke out earlier)"
     elif now_above and not (volume_confirmed and momentum_positive):
-        status = "BREAKOUT WATCH (needs volume/momentum confirmation)"
+        status = "BREAKOUT ATTEMPT (needs volume/momentum confirmation)"
     elif (not now_above) and prev["Close"] > resistance and price < resistance:
         status = "FAILED BREAKOUT"
     elif distance_pct is not None and 0 <= distance_pct <= 3:
-        status = "BREAKOUT WATCH"
+        status = "BREAKOUT READY"
     else:
         status = "NO BREAKOUT"
+
+    if near_52w_high and "BREAKOUT" in status:
+        status = status + " / 52W HIGH BREAKOUT"
 
     return {
         "status": status,
@@ -556,11 +579,11 @@ def _volume_component(vol_ratio):
 
 
 def _setup_component(breakout_status, pullback_status):
-    if breakout_status == "BREAKOUT CONFIRMED":
+    if breakout_status.startswith("BREAKOUT CONFIRMED"):
         return 100
     if pullback_status == "HEALTHY PULLBACK":
         return 88
-    if breakout_status == "BREAKOUT WATCH" or "WATCH" in breakout_status:
+    if breakout_status.startswith("BREAKOUT READY") or breakout_status.startswith("BREAKOUT ATTEMPT"):
         return 65
     if pullback_status == "PULLBACK WATCH":
         return 55
@@ -642,8 +665,8 @@ def signal_engine(d, trend, momentum, breakout, pullback, sr, risk_data, regime)
         reasons.append("+ Momentum " + momentum["label"])
     elif components["momentum"] <= 35:
         reasons.append("- Momentum " + momentum["label"])
-    if breakout["status"] == "BREAKOUT CONFIRMED":
-        reasons.append("+ Breakout confirmed with volume " + str(round(breakout["volume_ratio"], 2)) + "x average")
+    if breakout["status"].startswith("BREAKOUT CONFIRMED"):
+        reasons.append("+ Breakout confirmed with volume " + str(round(breakout["volume_ratio"], 2)) + "x average (" + breakout["status"] + ")")
     if pullback["status"] == "HEALTHY PULLBACK":
         reasons.append("+ Healthy pullback to support/EMA20")
     if pullback["status"] == "BROKEN SUPPORT":
@@ -673,6 +696,7 @@ def signal_engine(d, trend, momentum, breakout, pullback, sr, risk_data, regime)
 # SECTION: FULL STOCK ANALYSIS (orchestrates all engines)
 # ============================================================
 
+@st.cache_data(ttl=300, show_spinner=False)
 def analyze_stock(ticker, period="1y"):
     df, status, error = fetch_ohlcv(ticker, period=period)
     if status != "SUCCESS":
@@ -839,7 +863,7 @@ def portfolio_decision(holding, result):
             return "HOLD / TRAIL STOP", "Trend remains bullish and position is profitable; trail the stop rather than exit early."
         return "HOLD", "Trend and signal remain constructive even though position is not yet profitable."
 
-    if result["breakout"]["status"] == "BREAKOUT CONFIRMED" and pnl_pct > 0:
+    if result["breakout"]["status"].startswith("BREAKOUT CONFIRMED") and pnl_pct > 0:
         return "ADD ON CONFIRMATION", "Fresh confirmed breakout with volume support while already in profit."
 
     if signal in ("SELL", "STRONG SELL"):
