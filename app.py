@@ -39,7 +39,12 @@ WEIGHTS = {
     "regime": 0.05,
 }
 
-MARKET_INDEX_CANDIDATES = ["^KSE100", "KSE100.KA", "PSX"]
+MARKET_INDEX_CANDIDATES = ["^KSE100", "^KSE", "KSE100.KA", "KSE.KA", "PSX", "^KSEALL"]
+# KSE-100 has traded in the tens-of-thousands to ~190,000+ range through 2026.
+# Used to sanity-check that a candidate ticker actually returned index-level
+# data and not, e.g., an unrelated low-priced stock quote.
+KSE100_PLAUSIBLE_MIN = 5000
+KSE100_PLAUSIBLE_MAX = 1000000
 
 # ============================================================
 # SECTION: DATA PROVIDER
@@ -93,7 +98,16 @@ def fetch_ohlcv(ticker, period="1y", interval="1d"):
             return None, "EMPTY", "Data became empty after cleaning."
 
         df.index = pd.to_datetime(df.index)
+        # Data-quality validation: don't assume a returned DataFrame is automatically valid.
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        df = df[(df["Close"] > 0) & (df["High"] > 0) & (df["Low"] > 0) & (df["Open"] > 0)]
+        df = df[df["High"] >= df["Low"]]
+        if df.empty:
+            return None, "EMPTY", "All rows failed data-quality validation (non-positive or inconsistent OHLC)."
+
         df["Volume"] = df["Volume"].fillna(0)
+        df.loc[df["Volume"] < 0, "Volume"] = 0
         return df, "SUCCESS", None
     except Exception as e:
         return None, "EXCEPTION", type(e).__name__ + ": " + str(e)
@@ -101,17 +115,61 @@ def fetch_ohlcv(ticker, period="1y", interval="1d"):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_index():
-    """Attempts a few known index ticker candidates. Returns (df_or_None, label_or_None)."""
+    """Attempts a few known KSE-100 candidate tickers. Returns (df_or_None, label_or_None).
+    IMPORTANT: does not assume a returned DataFrame is actually KSE-100 data just
+    because yfinance returned something for that symbol - validates the price
+    level is plausible for the index before accepting it. This is a best-effort
+    heuristic, not a guarantee; if no candidate is verified working, market
+    regime correctly reports UNAVAILABLE rather than fabricating a reading."""
     for cand in MARKET_INDEX_CANDIDATES:
         try:
             raw = yf.download(cand, period="6mo", interval="1d", auto_adjust=False, progress=False)
-            if raw is not None and not raw.empty:
-                df = _flatten_columns(raw)
-                if "Close" in df.columns:
-                    return df, cand
+            if raw is None or raw.empty:
+                continue
+            df = _flatten_columns(raw)
+            if "Close" not in df.columns:
+                continue
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                continue
+            last_close = float(df["Close"].iloc[-1])
+            if not (KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX):
+                continue  # doesn't look like an index level - reject, don't guess
+            return df, cand
         except Exception:
             continue
     return None, None
+
+
+def diagnose_market_index_candidates():
+    """Diagnostic helper (mirrors the earlier connectivity test): reports the
+    exact outcome for every KSE-100 candidate ticker so failures are visible
+    rather than silently swallowed. Not cached - meant for on-demand use."""
+    rows = []
+    for cand in MARKET_INDEX_CANDIDATES:
+        try:
+            raw = yf.download(cand, period="6mo", interval="1d", auto_adjust=False, progress=False)
+            if raw is None or raw.empty:
+                rows.append({"Candidate": cand, "Status": "EMPTY", "Rows": 0, "Latest Close": None, "Note": "No data returned"})
+                continue
+            df = _flatten_columns(raw)
+            if "Close" not in df.columns:
+                rows.append({"Candidate": cand, "Status": "NO CLOSE COLUMN", "Rows": len(df), "Latest Close": None, "Note": "Close missing after flatten"})
+                continue
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                rows.append({"Candidate": cand, "Status": "EMPTY AFTER CLEAN", "Rows": 0, "Latest Close": None, "Note": ""})
+                continue
+            last_close = float(df["Close"].iloc[-1])
+            plausible = KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX
+            rows.append({
+                "Candidate": cand, "Status": "PLAUSIBLE INDEX LEVEL" if plausible else "REJECTED (implausible level)",
+                "Rows": len(df), "Latest Close": round(last_close, 2),
+                "Note": "Accepted as KSE-100 source" if plausible else "Level outside expected index range",
+            })
+        except Exception as e:
+            rows.append({"Candidate": cand, "Status": "EXCEPTION", "Rows": 0, "Latest Close": None, "Note": type(e).__name__ + ": " + str(e)})
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -209,8 +267,10 @@ def build_indicators(df):
     d["RETURN_1D"] = d["Close"].pct_change()
     d["VOLATILITY_20"] = d["RETURN_1D"].rolling(20).std() * np.sqrt(252)
     d["ROC_10"] = d["Close"].pct_change(10) * 100
-    d["52W_HIGH"] = d["Close"].rolling(252, min_periods=20).max()
-    d["52W_LOW"] = d["Close"].rolling(252, min_periods=20).min()
+    # 52W high/low must exclude today's own candle (look-ahead bias) and
+    # should reference High/Low (the actual traded extremes), not Close.
+    d["52W_HIGH"] = d["High"].shift(1).rolling(252, min_periods=20).max()
+    d["52W_LOW"] = d["Low"].shift(1).rolling(252, min_periods=20).min()
     return d
 
 
@@ -224,29 +284,68 @@ def min_history_ok(d, needed=210):
 # ============================================================
 
 @st.cache_data(ttl=300, show_spinner=False)
-def market_regime():
-    # Cached: without this, analyze_stock() (called once per ticker in the
-    # screener/portfolio loops) was recomputing the same index-level SMA
-    # calculation dozens of times per run.
+def market_snapshot():
+    """Rich KSE-100 status: distinguishes MARKET REGIME (risk environment)
+    from MARKET TREND (directional structure, computed with the same
+    trend_engine used for individual stocks) so the UI can show them
+    side-by-side against a stock's own trend, per audit requirement."""
     idx_df, label = fetch_market_index()
     if idx_df is None or len(idx_df) < 60:
-        return "UNAVAILABLE", None, "Market index data unavailable from provider."
+        return {
+            "regime": "UNAVAILABLE", "market_trend": "UNAVAILABLE", "label": None,
+            "note": "KSE-100 data unavailable from any verified candidate source.",
+            "last_date": None, "last_close": None,
+        }
+
     d = idx_df.copy()
-    d["SMA20"] = sma(d["Close"], 20)
-    d["SMA50"] = sma(d["Close"], 50)
-    last = d.iloc[-1]
-    vol20 = d["Close"].pct_change().rolling(20).std().iloc[-1] * np.sqrt(252)
+    if "Volume" not in d.columns:
+        d["Volume"] = 0.0
+    has_ohlc = all(c in d.columns for c in ["Open", "High", "Low"])
 
-    if pd.isna(last["SMA20"]) or pd.isna(last["SMA50"]):
-        return "UNAVAILABLE", label, "Insufficient index history."
+    last_date = d.index[-1]
+    last_close = float(d["Close"].iloc[-1])
 
-    if vol20 is not None and vol20 > 0.35:
-        return "HIGH VOLATILITY", label, None
-    if last["Close"] > last["SMA20"] > last["SMA50"]:
-        return "BULLISH", label, None
-    if last["Close"] < last["SMA20"] < last["SMA50"]:
-        return "BEARISH", label, None
-    return "NEUTRAL", label, None
+    if has_ohlc:
+        d_ind = build_indicators(d)
+        m_trend, _ = trend_engine(d_ind)
+        last = d_ind.iloc[-1]
+        sma20, sma50 = last["SMA20"], last["SMA50"]
+        vol20 = d_ind["RETURN_1D"].rolling(20).std().iloc[-1] * np.sqrt(252)
+    else:
+        d["SMA20"] = sma(d["Close"], 20)
+        d["SMA50"] = sma(d["Close"], 50)
+        last = d.iloc[-1]
+        sma20, sma50 = last["SMA20"], last["SMA50"]
+        vol20 = d["Close"].pct_change().rolling(20).std().iloc[-1] * np.sqrt(252)
+        m_trend = "UNAVAILABLE"
+
+    if pd.isna(sma20) or pd.isna(sma50):
+        regime = "UNAVAILABLE"
+        note = "Insufficient index history for a reliable regime read."
+    elif vol20 is not None and vol20 > 0.35:
+        regime = "HIGH VOLATILITY"
+        note = None
+    elif last_close > sma20 > sma50:
+        regime = "BULLISH"
+        note = None
+    elif last_close < sma20 < sma50:
+        regime = "BEARISH"
+        note = None
+    else:
+        regime = "NEUTRAL"
+        note = None
+
+    return {
+        "regime": regime, "market_trend": m_trend, "label": label, "note": note,
+        "last_date": last_date, "last_close": last_close,
+    }
+
+
+def market_regime():
+    """Backward-compatible 3-tuple wrapper around market_snapshot() so
+    existing call sites (analyze_stock, signal_engine) keep working unchanged."""
+    snap = market_snapshot()
+    return snap["regime"], snap["label"], snap["note"]
 
 
 # ============================================================
@@ -339,8 +438,8 @@ def support_resistance(d):
         "primary_resistance": primary_resistance,
         "secondary_support": secondary_support,
         "secondary_resistance": secondary_resistance,
-        "high_52w": high_52w if not pd.isna(high_52w) else secondary_resistance,
-        "low_52w": low_52w if not pd.isna(low_52w) else secondary_support,
+        "high_52w": high_52w,  # genuinely NaN if insufficient history - do not fabricate
+        "low_52w": low_52w,
     }
 
 
@@ -355,7 +454,21 @@ def breakout_engine(d, sr, vol_ratio_threshold=1.5):
     price = last["Close"]
     vol_ratio = last["VOL_RATIO"] if not pd.isna(last["VOL_RATIO"]) else 0
 
-    was_below = prev["Close"] <= resistance
+    # Freshness baseline: resistance as it stood BEFORE yesterday's and today's
+    # candles (excludes both). The display 'resistance' above legitimately
+    # includes yesterday's candle per the support/resistance window - but using
+    # that same rolling number to judge "fresh vs extended" self-contaminates,
+    # since an extended multi-day move keeps dragging its own resistance up
+    # with it (yesterday's elevated high enters the window), making an old
+    # breakout look "fresh" every single day. A stable prior-2-days baseline
+    # avoids that.
+    if len(d) >= 22:
+        baseline_window = d.iloc[:-2].tail(20)
+        baseline_resistance = baseline_window["High"].max()
+    else:
+        baseline_resistance = resistance
+
+    was_below = prev["Close"] <= baseline_resistance
     now_above = price > resistance
     fresh_cross = now_above and was_below  # today is the actual breakout session
     volume_confirmed = vol_ratio >= vol_ratio_threshold
@@ -366,22 +479,31 @@ def breakout_engine(d, sr, vol_ratio_threshold=1.5):
 
     if now_above and volume_confirmed and momentum_positive and fresh_cross:
         status = "BREAKOUT CONFIRMED"
+        note = "Closed above prior resistance today with volume and momentum confirmation."
     elif now_above and volume_confirmed and momentum_positive and not fresh_cross:
-        status = "BREAKOUT CONFIRMED (extended - already broke out earlier)"
+        status = "BREAKOUT CONFIRMED (EXTENDED)"
+        note = "Already broke out on a prior session; today is a continuation, not a fresh signal."
     elif now_above and not (volume_confirmed and momentum_positive):
-        status = "BREAKOUT ATTEMPT (needs volume/momentum confirmation)"
-    elif (not now_above) and prev["Close"] > resistance and price < resistance:
+        status = "BREAKOUT ATTEMPT"
+        note = "Price is above resistance but volume/momentum confirmation is missing."
+    elif (not now_above) and prev["Close"] > baseline_resistance and price < baseline_resistance:
         status = "FAILED BREAKOUT"
+        note = "Price broke above resistance on a prior session but has closed back below it."
     elif distance_pct is not None and 0 <= distance_pct <= 3:
         status = "BREAKOUT READY"
+        note = "Within 3% of prior resistance; not yet broken out."
     else:
         status = "NO BREAKOUT"
+        note = "Not currently near a breakout level."
 
     if near_52w_high and "BREAKOUT" in status:
         status = status + " / 52W HIGH BREAKOUT"
+        note = note + " Also at/near the prior 52-week high."
 
     return {
         "status": status,
+        "note": note,
+        "fresh_cross": fresh_cross,
         "resistance": resistance,
         "price": price,
         "volume_ratio": vol_ratio,
@@ -579,15 +701,26 @@ def _volume_component(vol_ratio):
 
 
 def _setup_component(breakout_status, pullback_status):
-    if breakout_status.startswith("BREAKOUT CONFIRMED"):
+    # Explicit classification - no substring/ambiguous matching.
+    is_fresh_confirmed = breakout_status.startswith("BREAKOUT CONFIRMED") and "EXTENDED" not in breakout_status
+    is_extended_confirmed = breakout_status.startswith("BREAKOUT CONFIRMED (EXTENDED)")
+    is_ready = breakout_status.startswith("BREAKOUT READY")
+    is_attempt = breakout_status.startswith("BREAKOUT ATTEMPT")
+    is_failed = breakout_status.startswith("FAILED BREAKOUT")
+
+    if is_fresh_confirmed:
         return 100
     if pullback_status == "HEALTHY PULLBACK":
         return 88
-    if breakout_status.startswith("BREAKOUT READY") or breakout_status.startswith("BREAKOUT ATTEMPT"):
+    if is_extended_confirmed:
+        return 78
+    if is_ready:
         return 65
-    if pullback_status == "PULLBACK WATCH":
+    if is_attempt:
         return 55
-    if breakout_status == "FAILED BREAKOUT" or pullback_status == "BROKEN SUPPORT":
+    if pullback_status == "PULLBACK WATCH":
+        return 50
+    if is_failed or pullback_status == "BROKEN SUPPORT":
         return 10
     return 40
 
@@ -706,7 +839,8 @@ def analyze_stock(ticker, period="1y"):
         return None, "INSUFFICIENT", "Only " + str(len(df)) + " candles available; need at least 30."
 
     d = build_indicators(df)
-    regime, regime_label, regime_note = market_regime()
+    mkt = market_snapshot()
+    regime = mkt["regime"]
     trend, trend_reasons = trend_engine(d)
     sr = support_resistance(d)
     breakout = breakout_engine(d, sr)
@@ -730,7 +864,10 @@ def analyze_stock(ticker, period="1y"):
         "risk": risk_data,
         "signal": signal_data,
         "regime": regime,
-        "regime_label": regime_label,
+        "regime_label": mkt["label"],
+        "market_trend": mkt["market_trend"],
+        "market_note": mkt["note"],
+        "market_data_date": mkt["last_date"],
         "has_sma200": has_sma200,
         "data_date": d.index[-1],
     }
@@ -756,9 +893,9 @@ def run_screener(universe, period="6mo"):
         if status != "SUCCESS":
             rows.append({
                 "Ticker": normalize_ticker(tkr), "Price": None, "Change %": None,
-                "Trend": None, "RSI": None, "Vol Ratio": None, "Score": None,
+                "Stock Trend": None, "Market Trend": None, "RSI": None, "Vol Ratio": None, "Score": None,
                 "Breakout": None, "Signal": "DATA ERROR", "Entry": None,
-                "Stop": None, "Target1": None, "R:R": None, "Note": error,
+                "Stop": None, "Target1": None, "R:R": None, "Data Date": None, "Note": error,
             })
             continue
 
@@ -770,7 +907,8 @@ def run_screener(universe, period="6mo"):
             "Ticker": result["ticker"],
             "Price": round(last["Close"], 2),
             "Change %": round(change_pct, 2),
-            "Trend": result["trend"],
+            "Stock Trend": result["trend"],
+            "Market Trend": result["market_trend"],
             "RSI": round(last["RSI14"], 1),
             "Vol Ratio": round(result["breakout"]["volume_ratio"], 2),
             "Score": result["signal"]["score"],
@@ -780,6 +918,7 @@ def run_screener(universe, period="6mo"):
             "Stop": round(result["risk"]["stop_loss"], 2),
             "Target1": round(result["risk"]["target1"], 2),
             "R:R": round(result["risk"]["rr1"], 2) if result["risk"]["rr1"] else None,
+            "Data Date": str(result["data_date"].date()),
             "Note": "",
         })
     return pd.DataFrame(rows)
@@ -889,17 +1028,95 @@ def metric_row(items):
         c.metric(label, value)
 
 
+def pkt_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Karachi"))
+    except Exception:
+        # fallback if zoneinfo/tzdata unavailable: Pakistan is UTC+5, no DST
+        from datetime import timedelta, timezone
+        return datetime.now(timezone.utc) + timedelta(hours=5)
+
+
+def data_freshness_label(data_date):
+    """Classifies data age as Fresh / Cached / Stale. A same-day or previous-
+    trading-day close is normal for PSX (session ends ~15:30 PKT) and should
+    not be flagged stale just because it isn't literally today's date."""
+    if data_date is None:
+        return "UNAVAILABLE", "No data date available."
+    now = pkt_now()
+    data_dt = pd.Timestamp(data_date)
+    if data_dt.tzinfo is None:
+        data_dt = data_dt.tz_localize(None)
+    now_naive = now.replace(tzinfo=None)
+    age_days = (now_naive.date() - data_dt.date()).days
+
+    if age_days <= 0:
+        return "FRESH", "Data matches today's date."
+    if age_days <= 3:
+        return "CACHED / LAST SESSION", str(age_days) + " day(s) old - normal for a weekend/holiday gap."
+    return "STALE", str(age_days) + " day(s) old - verify the data source."
+
+
+def explain_indicator_urdu(key, result):
+    """Generates a dynamic, Roman Urdu explanation from ACTUAL computed
+    values for this specific stock - not hardcoded boilerplate text."""
+    last = result["last"]
+    price = last["Close"]
+
+    if key == "trend":
+        return "Trend: " + result["ticker"] + " ka current trend **" + result["trend"] + "** hai."
+    if key == "sma20":
+        rel = "upar" if price > last["SMA20"] else "neeche"
+        pressure = "short-term pressure positive" if rel == "upar" else "short-term pressure negative"
+        return "SMA20 (20-din average): Price SMA20 (" + str(round(last["SMA20"], 2)) + ") se " + rel + " hai -> " + pressure + "."
+    if key == "sma50":
+        rel = "upar" if price > last["SMA50"] else "neeche"
+        return "SMA50 (50-din average): Price SMA50 (" + str(round(last["SMA50"], 2)) + ") se " + rel + " hai -> medium-term trend " + ("mazboot" if rel == "upar" else "kamzor") + "."
+    if key == "support":
+        return "Support: " + str(round(result["sr"]["primary_support"], 2)) + " ke qareeb support hai - yahan historically buying interest nazar aaya."
+    if key == "resistance":
+        return "Resistance: " + str(round(result["sr"]["primary_resistance"], 2)) + " ke qareeb resistance hai - yahan historically selling pressure aya."
+    if key == "breakout":
+        return "Breakout: " + result["breakout"]["status"] + ". " + result["breakout"]["note"]
+    if key == "momentum":
+        rsi_val = round(last["RSI14"], 1)
+        macd_dir = "positive" if last["MACD_HIST"] > 0 else "negative"
+        return "Momentum: RSI " + str(rsi_val) + " hai aur MACD " + macd_dir + " hai -> momentum " + result["momentum"]["label"].lower() + "."
+    if key == "market":
+        if result["regime"] == "UNAVAILABLE":
+            return "Market: KSE-100 data is waqt available nahi hai, is liye market-level confidence kam rakha gaya hai."
+        return "Market: KSE-100 regime **" + result["regime"] + "** hai, market trend **" + result["market_trend"] + "** hai."
+    if key == "final":
+        sig = result["signal"]
+        return "Final: Is waqt setup **" + sig["signal"] + "** hai (" + sig["setup_quality"] + ") kyunke: " + "; ".join(sig["reasons"][:3]) + "."
+    return ""
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
 
 st.sidebar.header("PSX Quant Engine")
-sidebar_ticker = st.sidebar.text_input("Ticker", value="SYS")
+st.sidebar.caption("Pakistan Stock Exchange (PSX) analysis - securities are PSX listings.")
+sidebar_ticker = st.sidebar.text_input("Ticker", value="SYS", help="e.g. SYS, SYS.KA, sys - all normalize the same way.")
 capital = st.sidebar.number_input("Capital (PKR)", min_value=10000, value=100000, step=10000)
 risk_pct = st.sidebar.slider("Risk per Trade (%)", 0.5, 5.0, 1.0, 0.5)
 max_alloc_pct = st.sidebar.slider("Max Capital Allocation (%)", 5, 100, 25, 5)
 period = st.sidebar.selectbox("Analysis Period", ["3mo", "6mo", "1y", "2y", "5y"], index=2)
 watchlist_input = st.sidebar.text_area("Watchlist (comma-separated)", value="SYS, OGDC, HBL, LUCK, FFC")
+
+st.sidebar.divider()
+if st.sidebar.button("Refresh Data", use_container_width=True):
+    fetch_ohlcv.clear()
+    fetch_market_index.clear()
+    market_snapshot.clear()
+    analyze_stock.clear()
+    st.session_state.pop("screener_df", None)
+    st.session_state.pop("watchlist_df", None)
+    st.sidebar.success("Cache cleared - next load will re-fetch from source.")
+st.sidebar.caption("Data source: yfinance. Cached up to 5 minutes for performance - use Refresh Data for the latest.")
+st.sidebar.caption("Checked: " + pkt_now().strftime("%d-%b-%Y %H:%M") + " PKT")
 
 st.sidebar.caption("Signals are analytical outputs based on historical price/volume data - not guaranteed investment advice.")
 
@@ -927,19 +1144,37 @@ with tab_dash:
         change_pct = (change / prev_close * 100) if prev_close else 0
         sig = result["signal"]
 
+        fresh_label, fresh_note = data_freshness_label(result["data_date"])
+        st.caption(
+            "Data: " + str(result["data_date"].date()) + " · Source: yfinance · Status: " + fresh_label
+            + " · Checked " + pkt_now().strftime("%H:%M PKT")
+        )
+
         c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         with c1:
             st.subheader(result["ticker"] + "  ·  PKR " + str(round(last["Close"], 2)))
-            st.caption(("+" if change >= 0 else "") + str(round(change, 2)) + " (" + str(round(change_pct, 2)) + "%) · Data: " + str(result["data_date"].date()))
+            st.caption(("+" if change >= 0 else "") + str(round(change, 2)) + " (" + str(round(change_pct, 2)) + "%)")
         with c2:
             st.markdown("**Signal**")
             st.markdown(":large_" + ("green" if "BUY" in sig["signal"] else "yellow" if sig["signal"] == "WAIT" else "red") + "_circle: " + sig["signal"])
         with c3:
             st.metric("Technical Score", str(sig["score"]) + "/100")
         with c4:
-            st.metric("Trend", result["trend"])
+            st.metric("Stock Trend", result["trend"])
 
-        st.caption("Setup quality: " + sig["setup_quality"] + " · Market regime: " + result["regime"])
+        mkt_col1, mkt_col2 = st.columns(2)
+        with mkt_col1:
+            st.caption("KSE-100 Market Regime: **" + result["regime"] + "**" + (" (" + result["regime_label"] + ")" if result["regime_label"] else ""))
+        with mkt_col2:
+            st.caption("KSE-100 Market Trend: **" + result["market_trend"] + "**")
+        if result["regime"] == "UNAVAILABLE":
+            st.caption("KSE-100 data unavailable - market-level confidence reduced. See Market Overview tab for diagnostics.")
+        elif result["trend"] not in ("UPTREND", "STRONG UPTREND") and result["market_trend"] in ("UPTREND", "STRONG UPTREND"):
+            st.caption("Note: this stock is diverging from the broader market - market is trending up while the stock is not.")
+        elif result["trend"] in ("UPTREND", "STRONG UPTREND") and result["market_trend"] not in ("UPTREND", "STRONG UPTREND"):
+            st.caption("Note: this stock is outperforming a market that isn't itself in an uptrend.")
+
+        st.caption("Setup quality: " + sig["setup_quality"])
 
         with st.expander("Why this signal?", expanded=True):
             for r in sig["reasons"]:
@@ -965,9 +1200,16 @@ with tab_dash:
             ("Max Loss", "PKR " + str(sizing["max_loss"])),
         ])
 
-        st.markdown("#### Chart")
-        show_bb = st.checkbox("Show Bollinger Bands", value=False)
-        st.plotly_chart(build_chart(result, show_bb), use_container_width=True)
+        chart_col, guide_col = st.columns([2.2, 1])
+        with chart_col:
+            st.markdown("#### Chart")
+            show_bb = st.checkbox("Show Bollinger Bands", value=False)
+            st.plotly_chart(build_chart(result, show_bb), use_container_width=True)
+        with guide_col:
+            st.markdown("#### Is Chart Ko Kaise Parhein?")
+            st.caption("Yeh explanation isi stock ke actual numbers se generate hui hai.")
+            for key in ["trend", "sma20", "sma50", "support", "resistance", "breakout", "momentum", "market", "final"]:
+                st.markdown(explain_indicator_urdu(key, result))
 
         st.markdown("#### Market Status")
         sr = result["sr"]
@@ -1065,8 +1307,9 @@ with tab_port:
                 rows.append({
                     "Ticker": normalize_ticker(h["ticker"]), "Buy Price": h["buy_price"], "Shares": h["shares"],
                     "Invested": round(invested, 2), "Current": round(cur_price, 2), "Value": round(cur_value, 2),
-                    "P/L": round(pnl, 2), "P/L %": round(pnl_pct, 2), "Trend": result["trend"],
-                    "Signal": result["signal"]["signal"], "Score": result["signal"]["score"],
+                    "P/L": round(pnl, 2), "P/L %": round(pnl_pct, 2), "Stock Trend": result["trend"],
+                    "Market Trend": result["market_trend"], "Signal": result["signal"]["signal"],
+                    "Score": result["signal"]["score"], "Data Date": str(result["data_date"].date()),
                     "Decision": decision, "Reason": reason,
                 })
             else:
@@ -1074,7 +1317,8 @@ with tab_port:
                 rows.append({
                     "Ticker": normalize_ticker(h["ticker"]), "Buy Price": h["buy_price"], "Shares": h["shares"],
                     "Invested": round(invested, 2), "Current": None, "Value": None, "P/L": None, "P/L %": None,
-                    "Trend": None, "Signal": "DATA ERROR", "Score": None, "Decision": "WATCH", "Reason": error,
+                    "Stock Trend": None, "Market Trend": None, "Signal": "DATA ERROR", "Score": None,
+                    "Data Date": None, "Decision": "WATCH", "Reason": error,
                 })
 
         total_pnl = total_current - total_invested
@@ -1098,15 +1342,33 @@ with tab_port:
 
 # ---------------- MARKET OVERVIEW ----------------
 with tab_market:
-    st.markdown("#### Market Overview")
-    regime, regime_label, regime_note = market_regime()
-    if regime == "UNAVAILABLE":
-        st.warning("Market index data unavailable from provider. Stock-level analysis continues to function independently.")
+    st.markdown("#### Market Overview - KSE-100 (Pakistan Stock Exchange)")
+    snap = market_snapshot()
+
+    if snap["regime"] == "UNAVAILABLE":
+        st.warning("KSE-100 index data unavailable from any verified candidate source. Stock-level analysis continues to function independently, but market-regime confidence is reduced in the signal score.")
+        st.caption(snap["note"] or "")
     else:
-        st.metric("Market Regime (" + str(regime_label) + ")", regime)
+        fresh_label, _ = data_freshness_label(snap["last_date"])
+        st.caption("Source: yfinance (" + str(snap["label"]) + ") · Data: " + str(pd.Timestamp(snap["last_date"]).date()) + " · Status: " + fresh_label)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Market Regime", snap["regime"])
+        m2.metric("Market Trend", snap["market_trend"])
+        m3.metric("KSE-100 Level", str(round(snap["last_close"], 2)))
         idx_df, _ = fetch_market_index()
         if idx_df is not None:
             st.line_chart(idx_df["Close"].tail(180))
+
+    with st.expander("KSE-100 source diagnostics (which candidate ticker is being used, and why)"):
+        st.caption("This mirrors the same connectivity-test approach used earlier for individual stocks - run it here to see exactly which KSE-100 candidate ticker yfinance is actually serving from this deployment, rather than assuming.")
+        if st.button("Test KSE-100 Candidate Sources"):
+            diag_df = diagnose_market_index_candidates()
+            st.dataframe(diag_df, use_container_width=True, hide_index=True)
+            accepted = diag_df[diag_df["Status"] == "PLAUSIBLE INDEX LEVEL"]
+            if accepted.empty:
+                st.error("No candidate ticker returned a plausible KSE-100 level. Market regime will correctly show UNAVAILABLE rather than guessing.")
+            else:
+                st.success("Using: " + accepted.iloc[0]["Candidate"])
 
 # ---------------- ADVANCED ANALYSIS ----------------
 with tab_adv:
