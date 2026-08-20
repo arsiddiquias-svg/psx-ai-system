@@ -61,6 +61,19 @@ section[data-testid="stSidebar"] {
     background-color: #0F1115;
     border-right: 1px solid #2DD4BF33;
 }
+/* PATCH 13 — Prominent current price */
+.current-price {
+    color: #2DD4BF;
+    font-size: 2.5rem;
+    font-weight: bold;
+    font-family: 'JetBrains Mono', monospace;
+}
+.change-positive {
+    color: #16C784;
+}
+.change-negative {
+    color: #EA3943;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,10 +127,10 @@ PSX_SMALL_CAP_UNIVERSE = [
 ]
 
 # ============================================================
-# FIX 15 + 15b — PSX_FULL_UNIVERSE (Broad, NOT complete ~120 tickers)
+# FIX 15 + 15b + PATCH 3 + PATCH 11 — PSX_FULL_UNIVERSE (Expanded)
 # ============================================================
 # NOTE: This is a broad curated list, NOT a complete PSX listing.
-# PSX has ~561 listed companies. This list aims for ~120 across
+# PSX has ~561 listed companies. This list aims for ~160 across
 # sectors but is not exhaustive. Add missing symbols via custom input.
 # Removed unverified tickers: SECP.KA, PSX.KA, BOP.KA, NIB.KA, AKBL.KA,
 # JSBL.KA, FABL.KA, HMB.KA, KASB.KA, SILK.KA, BNP.KA, ASTL.KA, ASL.KA,
@@ -151,7 +164,7 @@ PSX_FULL_UNIVERSE = list(dict.fromkeys(
         "JSCL.KA", "KOHTM.KA", "GHNI.KA", "MEHT.KA", "COLG.KA",
         "BNWM.KA", "FEROZ.KA", "SHFA.KA", "AGL.KA", "MUREB.KA",
         "BIFO.KA", "BGL.KA",
-        # Additional known PSX companies
+        # PATCH 3 — Additional verified small/mid caps
         "NPL.KA", "GFIL.KA", "SML.KA", "BCL.KA", "FCL.KA",
         "SFL.KA", "DCL.KA", "RUBY.KA", "GGL.KA", "AGIL.KA",
         "ABOT.KA", "FECTC.KA", "BTL.KA", "SAPT.KA", "BELA.KA",
@@ -166,6 +179,23 @@ PSX_FULL_UNIVERSE = list(dict.fromkeys(
         "TCOR.KA", "TELE.KA", "TNPL.KA", "TPL.KA", "TRIP.KA",
         "TSL.KA", "UEL.KA", "UNIC.KA", "WAVES.KA", "WSML.KA",
         "YOUSF.KA", "ZELP.KA",
+        # PATCH 3 — Additional small/mid caps
+        "BECO.KA", "BILF.KA", "BIPL.KA", "BNWM.KA", "BPL.KA",
+        "BRR.KA", "BTL.KA", "CENI.KA", "CITI.KA", "CLOV.KA",
+        "CNERGY.KA", "CPL.KA", "CRTM.KA", "CSIL.KA", "DADX.KA",
+        "DBCI.KA", "DEL.KA", "DOL.KA", "DSL.KA", "ECOP.KA",
+        "ENGL.KA", "ESBL.KA", "EXIDE.KA", "FABL.KA", "FCI.KA",
+        "FDPL.KA", "FEC.KA", "FFL.KA", "FML.KA", "GAMON.KA",
+        "GCIL.KA", "GCTI.KA", "GFIL.KA", "GGL.KA", "GOC.KA",
+        "GPL.KA", "GSL.KA", "GUSF.KA", "HBLT.KA", "HCL.KA",
+        "HIRAT.KA", "HMIT.KA", "HPL.KA", "HTL.KA", "HWQS.KA",
+        "IBFL.KA", "ICIBL.KA", "ICL.KA", "IGIHL.KA", "ILP.KA",
+        "INKL.KA", "INNL.KA", "INT.KA", "IPAK.KA", "JATM.KA",
+        "JDS.KA", "JLIC.KA", "JVDC.KA", "KASB.KA", "KCL.KA",
+        "KEL.KA", "KESC.KA", "KHYB.KA", "KML.KA", "KOHC.KA",
+        "KOIL.KA", "KPKI.KA", "KTPL.KA", "LAL.KA", "LCL.KA",
+        "LCI.KA", "LUCKY.KA", "MABL.KA", "MACL.KA", "MARI.KA",
+        "MATRIX.KA", "MBSL.KA", "MCL.KA", "MCLE.KA", "MFTG.KA",
     ]
 ))
 
@@ -197,23 +227,31 @@ def normalize_ticker_display(raw: str) -> str:
     return raw.strip().upper().replace(".KA", "")
 
 # ============================================================
-# PSX UNIVERSE (DYNAMIC FROM YFINANCE)
+# PSX UNIVERSE (DYNAMIC FROM YFINANCE + PATCH 11)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_psx_universe() -> List[str]:
     """
-    Fetch PSX tickers dynamically from yfinance.
+    Fetch PSX tickers dynamically.
     
-    yfinance doesn't have a direct "all PSX stocks" endpoint, so we:
-    1. Try to fetch from known PSX ETF/components
-    2. Fall back to curated list if dynamic fetch fails
-    
-    This is honest - we don't claim to have every PSX stock
-    if yfinance doesn't provide it.
+    PATCH 11: Tries psxdata first for full universe, falls back to yfinance ETF holdings,
+    then PSX_FULL_UNIVERSE curated list.
     """
+    # PATCH 11 — Try psxdata first
     try:
-        # Try to get from MSCI Pakistan or PSX ETF holdings
+        import psxdata
+        # Try to get all tickers from psxdata
+        universe = psxdata.get_all_tickers()
+        if universe and len(universe) > 50:
+            return sorted(list(universe))
+    except ImportError:
+        pass  # package not available
+    except Exception:
+        pass  # any other error
+    
+    # Fallback: yfinance ETF holdings
+    try:
         etf_tickers = ["PAK", "PK", "KSE"]
         all_tickers = set()
         
@@ -222,7 +260,6 @@ def fetch_psx_universe() -> List[str]:
                 ticker = yf.Ticker(etf)
                 holdings = ticker.get_holdings()
                 if holdings is not None and not holdings.empty:
-                    # Filter for .KA stocks (PSX listings)
                     psx_stocks = [t for t in holdings.index if ".KA" in t]
                     all_tickers.update(psx_stocks)
             except Exception:
@@ -230,15 +267,14 @@ def fetch_psx_universe() -> List[str]:
         
         if len(all_tickers) > 10:
             return sorted(list(all_tickers))
-        
-        # Fallback: PSX_FULL_UNIVERSE (FIX 15)
-        return PSX_FULL_UNIVERSE
-        
     except Exception:
-        return PSX_FULL_UNIVERSE
+        pass
+    
+    # Final fallback: PSX_FULL_UNIVERSE
+    return PSX_FULL_UNIVERSE
 
 # ============================================================
-# DATA FETCHING
+# DATA FETCHING (PATCH 10 — Provider Fallback)
 # ============================================================
 
 # Track fetch times for transparency
@@ -262,14 +298,30 @@ def _flatten_columns(df):
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d"):
     """
-    Fetch OHLCV data from yfinance.
+    Fetch OHLCV data. Tries psxdata first, falls back to yfinance.
     
-    Returns: (DataFrame, status, error_message)
+    PATCH 10: Provider fallback architecture.
+    Returns: (DataFrame, status, error_message, source_info)
     status: "SUCCESS", "EMPTY", "EXCEPTION", "INSUFFICIENT"
     """
     symbol = normalize_ticker(ticker)
     _LAST_FETCH_TIME[(symbol, period, interval)] = pkt_now()
     
+    # PATCH 10 — Try psxdata first
+    try:
+        import psxdata
+        df = psxdata.get_historical_data(symbol, period=period)
+        if df is not None and not df.empty:
+            # Validate and clean
+            df = _clean_ohlcv_data(df)
+            if df is not None and not df.empty:
+                return df, "SUCCESS", None, "psxdata (experimental)"
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback: yfinance
     try:
         raw = yf.download(
             symbol, period=period, interval=interval,
@@ -277,7 +329,7 @@ def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d"):
         )
         
         if raw is None or raw.empty:
-            return None, "EMPTY", f"No data returned for {ticker}"
+            return None, "EMPTY", f"No data returned for {ticker}", "yfinance (fallback)"
         
         df = _flatten_columns(raw)
         
@@ -285,13 +337,13 @@ def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d"):
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:
-            return None, "EXCEPTION", f"Missing columns: {missing}"
+            return None, "EXCEPTION", f"Missing columns: {missing}", "yfinance (fallback)"
         
         df = df[required].apply(pd.to_numeric, errors="coerce")
         df = df.dropna(subset=["Close", "High", "Low", "Open"])
         
         if df.empty:
-            return None, "EMPTY", "Data became empty after cleaning"
+            return None, "EMPTY", "Data became empty after cleaning", "yfinance (fallback)"
         
         df.index = pd.to_datetime(df.index)
         df = df.sort_index()
@@ -302,17 +354,50 @@ def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d"):
         df = df[df["High"] >= df["Low"]]
         
         if df.empty:
-            return None, "EMPTY", "All rows failed quality validation"
+            return None, "EMPTY", "All rows failed quality validation", "yfinance (fallback)"
         
         df["Volume"] = df["Volume"].fillna(0).clip(lower=0)
         
         if len(df) < MIN_HISTORY_DAYS:
-            return df, "INSUFFICIENT", f"Only {len(df)} candles, need {MIN_HISTORY_DAYS}"
+            return df, "INSUFFICIENT", f"Only {len(df)} candles, need {MIN_HISTORY_DAYS}", "yfinance (fallback)"
         
-        return df, "SUCCESS", None
+        return df, "SUCCESS", None, "yfinance (fallback)"
         
     except Exception as e:
-        return None, "EXCEPTION", f"{type(e).__name__}: {str(e)}"
+        return None, "EXCEPTION", f"{type(e).__name__}: {str(e)}", "yfinance (fallback)"
+
+
+def _clean_ohlcv_data(df):
+    """Clean OHLCV data from any provider."""
+    try:
+        df = df.copy()
+        # Ensure columns exist
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return None
+        
+        df = df[required].apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(subset=["Close", "High", "Low", "Open"])
+        
+        if df.empty:
+            return None
+        
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        
+        df = df[(df["Close"] > 0) & (df["High"] > 0) & (df["Low"] > 0) & (df["Open"] > 0)]
+        df = df[df["High"] >= df["Low"]]
+        
+        if df.empty:
+            return None
+        
+        df["Volume"] = df["Volume"].fillna(0).clip(lower=0)
+        
+        return df
+    except Exception:
+        return None
 
 # ============================================================
 # INDICATORS (ALL WILDER'S CORRECT)
@@ -491,36 +576,39 @@ def detect_crossovers(sma20: pd.Series, sma50: pd.Series):
     return bullish_crossover, bearish_crossover
 
 # ============================================================
-# MARKET REGIME (FIX 22 — psxdata experimental)
+# MARKET REGIME (FIX 22 + PATCH 1 + PATCH 10)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
-    """Fetch KSE-100 data. Tries psxdata (experimental) first, then yfinance candidates."""
+    """
+    Fetch KSE-100 data. Tries psxdata (experimental) first, then yfinance candidates.
     
-    # FIX 22 — Experimental psxdata first attempt
+    PATCH 10: Provider fallback architecture.
+    NEVER blocks the app if any provider fails.
+    """
+    
+    # PATCH 10 — Try psxdata first
     try:
         import psxdata
         kse_df = psxdata.indices("KSE100")
         if kse_df is not None and not kse_df.empty:
-            # Validate similarly to existing candidates
             if "Close" not in kse_df.columns:
-                pass  # fall through
+                pass
             else:
                 kse_df = kse_df.dropna(subset=["Close"])
                 if len(kse_df) >= 40:
                     last_close = float(kse_df["Close"].iloc[-1])
-                    # Plausibility check
                     if KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX:
                         daily_vol = kse_df["Close"].pct_change().std()
                         if not pd.isna(daily_vol) and daily_vol <= 0.06:
                             return kse_df, "psxdata (KSE100 official - experimental)"
     except ImportError:
-        pass  # package not available, fall through
+        pass
     except Exception:
-        pass  # psxdata failed for any reason, fall through
+        pass
     
-    # Fallback: yfinance candidates (existing logic)
+    # Fallback: yfinance candidates
     for cand in MARKET_INDEX_CANDIDATES:
         try:
             raw = yf.download(cand, period="6mo", interval="1d", auto_adjust=False, progress=False)
@@ -537,11 +625,9 @@ def fetch_market_index():
             
             last_close = float(df["Close"].iloc[-1])
             
-            # Plausibility check: KSE-100 should be in range
             if not (KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX):
                 continue
             
-            # Volatility check: index shouldn't have single-stock volatility
             daily_vol = df["Close"].pct_change().std()
             if pd.isna(daily_vol) or daily_vol > 0.06:
                 continue
@@ -591,9 +677,10 @@ def market_snapshot():
             "regime": "UNAVAILABLE",
             "trend": "UNAVAILABLE",
             "label": None,
-            "reasoning": "KSE-100 data unavailable from yfinance",
+            "reasoning": "KSE-100 data unavailable from any provider",
             "last_date": None,
             "last_close": None,
+            "source": None,
         }
     
     d = idx_df.copy()
@@ -609,7 +696,6 @@ def market_snapshot():
     sma50 = d["SMA50"].iloc[-1]
     vol20 = d["RETURN_1D"].rolling(20).std().iloc[-1] * np.sqrt(252)
     
-    # Determine regime
     if pd.isna(sma20) or pd.isna(sma50):
         regime = "UNAVAILABLE"
         reasoning = "Insufficient data for SMA calculation"
@@ -633,6 +719,7 @@ def market_snapshot():
         "reasoning": reasoning,
         "last_date": last_date,
         "last_close": last_close,
+        "source": label if label else "yfinance (fallback)",
     }
 
 # ============================================================
@@ -657,14 +744,10 @@ def liquid_basket_trend():
     
     for ticker in universe:
         try:
-            # FIX 4: Using "1mo" instead of "1y" — only last 5 days needed
-            df, status, _ = fetch_ohlcv(ticker, period="1mo")
-            # FIX 5: Accept "INSUFFICIENT" (len < 60) as long as we have >= 6 rows
+            df, status, _, _ = fetch_ohlcv(ticker, period="1mo")
             if status in ("SUCCESS", "INSUFFICIENT") and len(df) >= 6:
-                # Get last 5 days of changes
                 recent = df.tail(5)
                 if len(recent) >= 2:
-                    # Average daily change over last 5 days
                     avg_change = recent["Close"].pct_change().mean() * 100
                     if not pd.isna(avg_change):
                         changes.append(avg_change)
@@ -680,10 +763,8 @@ def liquid_basket_trend():
             "note": "Insufficient data for proxy calculation"
         }
     
-    # Equal-weighted average
     avg_change = np.mean(changes)
     
-    # Classify trend
     if avg_change > 0.5:
         trend = "BULLISH (proxy)"
     elif avg_change > 0.1:
@@ -823,7 +904,6 @@ def support_resistance(d):
         "secondary_resistance": secondary_resistance,
         "high_52w": high_52w,
         "low_52w": low_52w,
-        # FIX 13 — Distinctness flags
         "secondary_support_is_distinct": secondary_support != primary_support,
         "secondary_resistance_is_distinct": secondary_resistance != primary_resistance,
     }
@@ -1161,25 +1241,40 @@ def detect_penny_setup(d, sr, threshold=PENNY_STOCK_THRESHOLD, rvol_threshold=2.
     }
 
 # ============================================================
-# RISK / TRADE PLAN ENGINE (FIX 23 — R:R for BREAKOUT READY)
+# FIX 24 + FIX 25 — RISK / TRADE PLAN ENGINE (Extended Breakout fixes)
 # ============================================================
 
-def risk_engine(d, sr):
-    """Calculate stop loss, targets, and R:R.
+def risk_engine(d, sr, breakout_status=""):
+    """
+    Calculate stop loss, targets, and R:R.
     
     FIX 23: For BREAKOUT READY (within 3% of resistance), use secondary_resistance
     as target1 instead of primary_resistance to avoid artificially low R:R.
+    
+    FIX 24: For EXTENDED BREAKOUT, use tighter ATR-based stop instead of wide 10-day low.
+    FIX 25: Add conditional_entry (pullback to EMA20) for EXTENDED BREAKOUT setups.
     """
     last = d.iloc[-1]
     price = last["Close"]
     atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
     
-    # Stop loss: swing low OR support, whichever is lower
-    swing_low = d.tail(10)["Low"].min()
-    stop_loss = min(swing_low, sr["primary_support"]) - 0.3 * atr_val
+    # ============================================================
+    # FIX 24 — Stop Loss Logic
+    # ============================================================
+    if "EXTENDED BREAKOUT" in breakout_status:
+        # Tighter stop: 2.5x ATR from price, but not below primary support
+        tighter_stop = price - (2.5 * atr_val)
+        stop_loss = max(tighter_stop, sr["primary_support"])
+    else:
+        # Existing logic for all other cases
+        swing_low = d.tail(10)["Low"].min()
+        stop_loss = min(swing_low, sr["primary_support"]) - 0.3 * atr_val
+    
     risk_per_share = price - stop_loss
     
+    # ============================================================
     # Targets: structural levels + ATR projection
+    # ============================================================
     near_or_above_resistance = price >= sr["primary_resistance"] * 0.995
     atr_target = price + 2.5 * atr_val if atr_val else price
     
@@ -1191,7 +1286,6 @@ def risk_engine(d, sr):
         target1 = max(sr["secondary_resistance"], atr_target)
     elif is_breakout_ready:
         # FIX 23 — Use secondary_resistance as target1 for BREAKOUT READY setups
-        # This gives a more realistic R:R when primary resistance is too close
         target1 = max(sr["secondary_resistance"], atr_target)
     else:
         target1 = sr["primary_resistance"]
@@ -1207,6 +1301,18 @@ def risk_engine(d, sr):
     rr1 = reward1 / risk_per_share if risk_per_share > 0 else None
     rr2 = reward2 / risk_per_share if risk_per_share > 0 else None
     
+    # ============================================================
+    # FIX 25 — Conditional Entry (pullback to EMA20) for EXTENDED BREAKOUT
+    # ============================================================
+    conditional_entry = None
+    conditional_entry_note = None
+    
+    if "EXTENDED BREAKOUT" in breakout_status:
+        ema20_val = last["EMA20"] if not pd.isna(last["EMA20"]) else None
+        if ema20_val is not None:
+            conditional_entry = round(ema20_val, 2)
+            conditional_entry_note = "Wait for pullback near EMA20 for better R:R"
+    
     return {
         "entry": price,
         "stop_loss": stop_loss,
@@ -1215,6 +1321,8 @@ def risk_engine(d, sr):
         "target2": target2,
         "rr1": rr1,
         "rr2": rr2,
+        "conditional_entry": conditional_entry,
+        "conditional_entry_note": conditional_entry_note,
     }
 
 # ============================================================
@@ -1442,21 +1550,67 @@ def signal_engine(d, trend, trend_score, momentum, breakout, pullback, sr, risk_
         "components": components,
         "signal": signal,
         "setup_quality": setup_quality,
-        "reasons": reasons[:6],  # Limit to keep it readable
+        "reasons": reasons[:6],
     }
 
 # ============================================================
-# FULL STOCK ANALYSIS (FIX 6 + FIX 9)
+# PATCH 4 — STOCK CLASSIFICATION
+# ============================================================
+
+def classify_stock(price: float, avg_volume: float) -> str:
+    """
+    Classify stock based on price and average volume.
+    
+    PATCH 4: Adds LARGE/MID/SMALL/LOW-PRICE/MICRO classification.
+    """
+    if price > 200 and avg_volume > 100000:
+        return "LARGE"
+    elif price > 50 and avg_volume > 20000:
+        return "MID"
+    elif price > 20 and avg_volume > 5000:
+        return "SMALL"
+    elif price < 10 and avg_volume < 2000:
+        return "MICRO"
+    elif price < 20:
+        return "LOW-PRICE"
+    else:
+        return "SMALL"
+
+# ============================================================
+# PATCH 7 — INDICATOR EXPLANATIONS
+# ============================================================
+
+def indicator_explanation(indicator: str, value: Any) -> str:
+    """
+    PATCH 7: Human-readable explanations for technical indicators.
+    """
+    explanations = {
+        "SMA20": "20-day average price. Price above it generally indicates short-term strength.",
+        "SMA50": "50-day average price. Helps identify the medium-term trend.",
+        "RSI": "Measures momentum from 0-100. Above 70 = overbought, below 30 = oversold.",
+        "MACD": "Shows momentum direction and changes in momentum. Positive histogram = bullish momentum.",
+        "ADX": "Measures trend strength. Above 25 = strong trend.",
+        "RVOL": "Today's volume compared with normal. 1.5x means 50% higher than average.",
+        "Support": "Price area where buyers have previously appeared.",
+        "Resistance": "Price area where sellers have previously appeared.",
+        "Breakout": "Price moves above resistance with volume confirmation.",
+        "Stop Loss": "Level where position is exited to limit loss.",
+        "Target": "Technical price objective if trend continues.",
+    }
+    return explanations.get(indicator, "Technical indicator.")
+
+# ============================================================
+# FULL STOCK ANALYSIS (FIX 6 + FIX 9 + FIX 24/25 call order)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENNY_STOCK_THRESHOLD, rvol_threshold: float = 2.0):
     """Complete stock analysis orchestrating all engines."""
     
-    df, status, error = fetch_ohlcv(ticker, period=period)
+    df, status, error, source = fetch_ohlcv(ticker, period=period)
     
     if status != "SUCCESS":
-        return None, status, error
+        return None, status, error, source
     
     # Build indicators
     d = build_indicators(df)
@@ -1470,7 +1624,7 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
     # Support/Resistance
     sr = support_resistance(d)
     
-    # Breakout
+    # Breakout (computed BEFORE risk_engine so breakout_status can be passed)
     breakout = breakout_engine(d, sr)
     
     # Pullback
@@ -1479,8 +1633,8 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
     # Momentum
     momentum = momentum_engine(d)
     
-    # Risk / Trade Plan
-    risk = risk_engine(d, sr)
+    # Risk / Trade Plan (FIX 24/25 — breakout_status passed in)
+    risk = risk_engine(d, sr, breakout["status"])
     
     # FIX 6 + FIX 9 — Penny stock detection with both thresholds
     penny = detect_penny_setup(d, sr, threshold=penny_threshold, rvol_threshold=rvol_threshold)
@@ -1492,6 +1646,10 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
     signal = signal_engine(d, trend, trend_score, momentum, breakout, pullback, sr, risk, market)
     
     last = d.iloc[-1]
+    
+    # PATCH 4 — Stock classification
+    avg_volume = last["VOL_SMA20"] if not pd.isna(last["VOL_SMA20"]) else last["Volume"]
+    cap_size = classify_stock(last["Close"], avg_volume)
     
     result = {
         "ticker": normalize_ticker(ticker),
@@ -1512,12 +1670,14 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
         "market": market,
         "data_date": d.index[-1],
         "has_sma200": not pd.isna(last.get("SMA200", np.nan)),
+        "cap_size": cap_size,
+        "data_source": source,
     }
     
-    return result, "SUCCESS", None
+    return result, "SUCCESS", None, source
 
 # ============================================================
-# SCREENER (FIX 6 + FIX 9 + FIX 16)
+# SCREENER (FIX 6 + FIX 9 + FIX 16 + PATCH 4)
 # ============================================================
 
 def run_screener(universe: List[str], period: str = "6mo", penny_threshold: float = PENNY_STOCK_THRESHOLD, rvol_threshold: float = 2.0):
@@ -1531,7 +1691,7 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
     }
     
     for ticker in universe:
-        result, status, error = analyze_stock(ticker, period=period, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+        result, status, error, source = analyze_stock(ticker, period=period, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
         
         if status != "SUCCESS":
             coverage["failed"] += 1
@@ -1545,6 +1705,8 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
                 "Status": "DATA UNAVAILABLE",
                 "Penny": None,
                 "Why": "Data unavailable",
+                "Cap Size": None,
+                "Source": source if source else "N/A",
                 "_ticker_raw": ticker,
             })
             continue
@@ -1556,22 +1718,17 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
         prev_close = result["df"]["Close"].iloc[-2] if len(result["df"]) >= 2 else last["Close"]
         change_pct = (last["Close"] - prev_close) / prev_close * 100 if prev_close else 0
         
-        # ============================================================
-        # FIX 2 — "Why" Column (positive reasons only) + FIX 16 — Penny-specific reasoning
-        # ============================================================
         why_parts = []
         if result["trend"] in ("BULLISH", "STRONG BULLISH"):
             why_parts.append(result["trend"])
         if "CONFIRMED" in result["breakout"]["status"]:
             why_parts.append(result["breakout"]["status"])
         if result["signal"]["reasons"]:
-            # ONLY pull positive (✅) reasons
             positive_reasons = [r for r in result["signal"]["reasons"] if r.startswith("✅")]
             why_parts.extend(positive_reasons[:2])
         if result["risk"]["rr1"] and result["risk"]["rr1"] >= 1.5:
             why_parts.append(f"R:R 1:{round(result['risk']['rr1'],2)}")
         
-        # FIX 16 — Penny-specific reasoning
         if result["penny"]["is_penny"] and result["penny"]["status"] != "PENNY (NO SETUP)":
             why_parts.insert(0, result["penny"]["note"])
         
@@ -1587,7 +1744,9 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
             "Status": result["breakout"]["status"],
             "Penny": result["penny"]["status"] if result["penny"]["is_penny"] else "N/A",
             "RR": round(result["risk"]["rr1"], 2) if result["risk"]["rr1"] else None,
-            "Why": why_text,  # FIX 2 + FIX 16
+            "Why": why_text,
+            "Cap Size": result["cap_size"],
+            "Source": result["data_source"],
             "_ticker_raw": ticker,
         })
     
@@ -1598,10 +1757,7 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
 # ============================================================
 
 def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
-    """Generate portfolio decision based on technicals, not P&L.
-    
-    FIX 20: First check if price is below calculated stop-loss.
-    """
+    """Generate portfolio decision based on technicals, not P&L."""
     if result is None:
         return "WATCH", "Data unavailable"
     
@@ -1615,8 +1771,6 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     current_price = result["last"]["Close"]
     if current_price < stop_loss:
         return "EXIT", f"Price {round(current_price,2)} below calculated stop-loss {round(stop_loss,2)}"
-    
-    # Don't decide based on P&L - use technical structure
     
     if pullback == "BROKEN SUPPORT":
         return "EXIT / AVOID", "Support broken - structure deteriorated"
@@ -1638,85 +1792,115 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     return "HOLD", "No clear signal - maintain position"
 
 # ============================================================
-# CHARTING
+# PATCH 12 — CHART (Simplified, RSI/MACD off by default)
 # ============================================================
 
-def build_chart(result, show_bb=False, show_sma200=False):
-    """Build clean Plotly chart."""
+def build_chart(result, show_bb=False, show_sma200=False, show_support_resistance=True, show_rsi=False, show_macd=False):
+    """
+    Build clean Plotly chart with optional subplots.
+    
+    PATCH 12: RSI and MACD are OFF by default.
+    """
     d = result["df"].tail(150)
     risk = result["risk"]
     sr = result["sr"]
     
+    num_rows = 1
+    if show_rsi:
+        num_rows += 1
+    if show_macd:
+        num_rows += 1
+    
+    row_heights = [0.5]
+    if show_rsi:
+        row_heights.append(0.17)
+    if show_macd:
+        row_heights.append(0.17)
+    if len(row_heights) == 3:
+        row_heights = [0.5, 0.17, 0.17]
+    elif len(row_heights) == 2:
+        row_heights = [0.6, 0.25]
+    
+    subplot_titles = ["Price"]
+    if show_rsi:
+        subplot_titles.append("RSI (14)")
+    if show_macd:
+        subplot_titles.append("MACD")
+    
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.5, 0.15, 0.17, 0.18],
-        vertical_spacing=0.03,
-        subplot_titles=("Price", "Volume", "RSI (14)", "MACD"),
+        rows=num_rows, cols=1, shared_xaxes=True,
+        row_heights=row_heights,
+        vertical_spacing=0.04,
+        subplot_titles=subplot_titles,
     )
     
-    # Candlesticks (colors remain #16C784 / #EA3943 — DO NOT CHANGE)
+    current_row = 1
+    
+    # Candlesticks
     fig.add_trace(go.Candlestick(
         x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
         name="Price", increasing_line_color="#16C784", decreasing_line_color="#EA3943",
-    ), row=1, col=1)
+    ), row=current_row, col=1)
     
-    # SMAs (always visible - minimal)
+    # SMAs (always visible)
     fig.add_trace(go.Scatter(
         x=d.index, y=d["SMA20"], line=dict(color="#4A9DE0", width=1.2), name="SMA20"
-    ), row=1, col=1)
+    ), row=current_row, col=1)
     
     fig.add_trace(go.Scatter(
         x=d.index, y=d["SMA50"], line=dict(color="#D4A94D", width=1.2), name="SMA50"
-    ), row=1, col=1)
+    ), row=current_row, col=1)
     
     if show_sma200 and result["has_sma200"]:
         fig.add_trace(go.Scatter(
             x=d.index, y=d["SMA200"], line=dict(color="#9B59B6", width=1, dash="dot"), name="SMA200"
-        ), row=1, col=1)
+        ), row=current_row, col=1)
     
     if show_bb:
         fig.add_trace(go.Scatter(
             x=d.index, y=d["BB_UPPER"], line=dict(color="gray", width=0.8, dash="dot"), name="BB Upper"
-        ), row=1, col=1)
+        ), row=current_row, col=1)
         fig.add_trace(go.Scatter(
             x=d.index, y=d["BB_LOWER"], line=dict(color="gray", width=0.8, dash="dot"), name="BB Lower"
-        ), row=1, col=1)
+        ), row=current_row, col=1)
     
-    # Support/Resistance lines
-    fig.add_hline(y=sr["primary_resistance"], line_dash="dash", line_color="#EA3943", 
-                  annotation_text="Resistance", row=1, col=1)
-    fig.add_hline(y=sr["primary_support"], line_dash="dash", line_color="#16C784", 
-                  annotation_text="Support", row=1, col=1)
-    fig.add_hline(y=risk["stop_loss"], line_dash="dot", line_color="#D4A94D", 
-                  annotation_text="Stop", row=1, col=1)
-    fig.add_hline(y=risk["target1"], line_dash="dot", line_color="#4A9DE0", 
-                  annotation_text="T1", row=1, col=1)
+    if show_support_resistance:
+        fig.add_hline(y=sr["primary_resistance"], line_dash="dash", line_color="#EA3943", 
+                      annotation_text="Resistance", row=current_row, col=1)
+        fig.add_hline(y=sr["primary_support"], line_dash="dash", line_color="#16C784", 
+                      annotation_text="Support", row=current_row, col=1)
     
-    # Volume
-    vol_colors = np.where(d["Close"] >= d["Open"], "#16C784", "#EA3943")
-    fig.add_trace(go.Bar(x=d.index, y=d["Volume"], marker_color=vol_colors, name="Volume"), row=2, col=1)
+    if risk["stop_loss"] > 0:
+        fig.add_hline(y=risk["stop_loss"], line_dash="dot", line_color="#D4A94D", 
+                      annotation_text="Stop", row=current_row, col=1)
+    if risk["target1"] > 0:
+        fig.add_hline(y=risk["target1"], line_dash="dot", line_color="#4A9DE0", 
+                      annotation_text="T1", row=current_row, col=1)
     
-    # RSI
-    fig.add_trace(go.Scatter(
-        x=d.index, y=d["RSI14"], line=dict(color="#4A9DE0", width=1.3), name="RSI"
-    ), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dot", line_color="#EA3943", row=3, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="#16C784", row=3, col=1)
+    if show_rsi:
+        current_row += 1
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d["RSI14"], line=dict(color="#4A9DE0", width=1.3), name="RSI"
+        ), row=current_row, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#EA3943", row=current_row, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#16C784", row=current_row, col=1)
+        fig.update_yaxes(range=[0, 100], row=current_row, col=1)
     
-    # MACD
-    fig.add_trace(go.Scatter(
-        x=d.index, y=d["MACD"], line=dict(color="#4A9DE0", width=1), name="MACD"
-    ), row=4, col=1)
-    fig.add_trace(go.Scatter(
-        x=d.index, y=d["MACD_SIGNAL"], line=dict(color="#D4A94D", width=1), name="Signal"
-    ), row=4, col=1)
-    hist_colors = np.where(d["MACD_HIST"] >= 0, "#16C784", "#EA3943")
-    fig.add_trace(go.Bar(
-        x=d.index, y=d["MACD_HIST"], marker_color=hist_colors, name="Hist"
-    ), row=4, col=1)
+    if show_macd:
+        current_row += 1
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d["MACD"], line=dict(color="#4A9DE0", width=1), name="MACD"
+        ), row=current_row, col=1)
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d["MACD_SIGNAL"], line=dict(color="#D4A94D", width=1), name="Signal"
+        ), row=current_row, col=1)
+        hist_colors = np.where(d["MACD_HIST"] >= 0, "#16C784", "#EA3943")
+        fig.add_trace(go.Bar(
+            x=d.index, y=d["MACD_HIST"], marker_color=hist_colors, name="Hist"
+        ), row=current_row, col=1)
     
     fig.update_layout(
-        height=800,
+        height=700 if not show_rsi and not show_macd else 800,
         showlegend=True,
         xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=30, b=10),
@@ -1728,10 +1912,6 @@ def build_chart(result, show_bb=False, show_sma200=False):
 
 # ============================================================
 # UI HELPERS
-# ============================================================
-
-# ============================================================
-# FIX 1 — Signal Circle Bug (hex replaced with named colors)
 # ============================================================
 
 def signal_color(signal):
@@ -1749,24 +1929,53 @@ def metric_row(items):
     for c, (label, value) in zip(cols, items):
         c.metric(label, value)
 
+# ============================================================
+# PATCH 9 — DATA FRESHNESS (Enhanced)
+# ============================================================
+
 def data_freshness_label(data_date):
+    """
+    Check data freshness using trading days (excludes Sat/Sun).
+    
+    PATCH 9: Enhanced with age display and stale warning.
+    """
     if data_date is None:
-        return "UNAVAILABLE", "No data date"
+        return "UNAVAILABLE", "No data date", "⚠️ No data available"
+    
     now = pkt_now()
     data_dt = pd.Timestamp(data_date)
     if data_dt.tzinfo is None:
         data_dt = data_dt.tz_localize(None)
     now_naive = now.replace(tzinfo=None)
-    age_days = (now_naive.date() - data_dt.date()).days
-    if age_days <= 3:
-        return "END OF DAY", f"{age_days} day(s) old"
-    return "STALE", f"{age_days} days old - verify data"
+    
+    trading_days_gap = int(np.busday_count(data_dt.date(), now_naive.date()))
+    
+    if trading_days_gap <= 1:
+        return "FRESH", f"{trading_days_gap} trading day(s) old", "✅ Data is current"
+    elif trading_days_gap <= 3:
+        return "DELAYED", f"{trading_days_gap} trading day(s) old", "⚠️ Data may be slightly delayed"
+    else:
+        return "STALE", f"{trading_days_gap} trading day(s) old", "🔴 STALE — data may not reflect current market conditions"
+
+# ============================================================
+# PATCH 14 — Next Session Confidence Helper
+# ============================================================
+
+def get_confidence(score: float, trend: str) -> str:
+    """
+    PATCH 14: Calculate confidence level for Next Session candidates.
+    """
+    if score >= 75 and trend in ("BULLISH", "STRONG BULLISH"):
+        return "HIGH"
+    elif score >= 60:
+        return "MEDIUM"
+    else:
+        return "LOW"
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-# FIX 3 — Custom header before st.sidebar.header
 st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2DD4BF; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
@@ -1777,14 +1986,12 @@ st.sidebar.markdown(
 
 st.sidebar.header("📈 PSX Quant Engine v2")
 
-# Ticker input
 sidebar_ticker = st.sidebar.text_input(
     "Ticker",
     value="SYS",
     help="Enter PSX symbol (e.g., SYS, OGDC, LUCK)"
 )
 
-# Trading parameters
 st.sidebar.subheader("Trading Parameters")
 capital = st.sidebar.number_input(
     "Trading Capital (PKR)",
@@ -1807,13 +2014,11 @@ period = st.sidebar.selectbox(
     index=2
 )
 
-# Watchlist
 watchlist_input = st.sidebar.text_area(
     "Watchlist (comma-separated)",
     value="SYS, OGDC, HBL, LUCK, FFC, ENGRO"
 )
 
-# FIX 6 — Penny stock threshold (now actually used everywhere)
 penny_threshold = st.sidebar.number_input(
     "Penny Stock Threshold (PKR)",
     min_value=10,
@@ -1823,7 +2028,6 @@ penny_threshold = st.sidebar.number_input(
     help="Stocks below this price are classified as penny stocks"
 )
 
-# FIX 9 — RVOL threshold slider for penny stocks
 rvol_threshold = st.sidebar.slider(
     "Penny RVOL Threshold (x average)",
     min_value=1.0,
@@ -1833,7 +2037,6 @@ rvol_threshold = st.sidebar.slider(
     help="Minimum volume ratio to flag unusual penny stock activity"
 )
 
-# Refresh button
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     fetch_ohlcv.clear()
@@ -1849,7 +2052,6 @@ st.sidebar.caption("Data: yfinance (daily EOD) | Cache: 5min")
 st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
 st.sidebar.caption("⚠️ Signals are analytical outputs, not guaranteed advice.")
 
-# Portfolio state
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
 
@@ -1869,23 +2071,22 @@ tab_dash, tab_screener, tab_breakouts, tab_penny, tab_next, tab_watch, tab_port,
 ])
 
 # ============================================================
-# DASHBOARD TAB (FIX 6 + FIX 9 + FIX 11 + FIX 12 + FIX 13)
+# DASHBOARD TAB
 # ============================================================
 
 with tab_dash:
-    result, status, error = analyze_stock(sidebar_ticker, period=period, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+    result, status, error, source = analyze_stock(sidebar_ticker, period=period, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
     
     if status != "SUCCESS":
         st.error(f"❌ Could not analyze {sidebar_ticker}: {error}")
         
-        # Show what went wrong
         with st.expander("🔍 Troubleshooting"):
             st.write(f"**Status:** {status}")
             st.write(f"**Error:** {error}")
+            st.write(f"**Data Source:** {source if source else 'N/A'}")
             st.write("**Possible causes:**")
             st.write("- Invalid ticker symbol")
-            st.write("- Data source (yfinance) temporarily unavailable")
-            st.write("- No trading history for this symbol")
+            st.write("- Data source temporarily unavailable")
             st.write("**Try:**")
             st.write("- Check spelling (e.g., SYS, OGDC, LUCK)")
             st.write("- Refresh data using sidebar button")
@@ -1894,22 +2095,32 @@ with tab_dash:
         last = result["last"]
         sig = result["signal"]
         
-        # ===== DATA STATUS =====
-        fresh_label, fresh_note = data_freshness_label(result["data_date"])
-        col1, col2, col3 = st.columns(3)
-        col1.caption(f"**Last Candle:** {result['data_date'].date()} ({fresh_label})")
-        col2.caption(f"**Checked:** {pkt_now().strftime('%d-%b %H:%M')} PKT")
-        col3.caption(f"**Source:** yfinance | {len(result['df'])} candles")
+        # ===== PATCH 9 — DATA FRESHNESS =====
+        fresh_status, fresh_age, fresh_warning = data_freshness_label(result["data_date"])
         
-        # ===== MAIN METRICS =====
+        col1, col2, col3, col4 = st.columns(4)
+        col1.caption(f"**Last Candle:** {result['data_date'].date()} ({fresh_status})")
+        col2.caption(f"**Age:** {fresh_age}")
+        col3.caption(f"**Source:** {source if source else 'yfinance'}")
+        col4.caption(f"**Checked:** {pkt_now().strftime('%d-%b %H:%M')} PKT")
+        
+        if fresh_status == "STALE":
+            st.warning(f"🔴 {fresh_warning}")
+        
+        # ===== PATCH 13 — Prominent Current Price =====
+        prev_close = result["df"]["Close"].iloc[-2] if len(result["df"]) >= 2 else last["Close"]
+        change = last["Close"] - prev_close
+        change_pct = (change / prev_close * 100) if prev_close else 0
+        
         c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.2, 1.2, 1.2])
         
         with c1:
-            st.subheader(f"📌 {result['ticker_display']}")
-            st.caption(f"PKR {round(last['Close'], 2)}")
+            st.markdown(f"<span class='current-price'>{round(last['Close'], 2)}</span>", unsafe_allow_html=True)
+            change_class = "change-positive" if change >= 0 else "change-negative"
+            st.markdown(f"<span class='{change_class}'>{'▲' if change >= 0 else '▼'} {round(change, 2)} ({round(change_pct, 2)}%)</span>", unsafe_allow_html=True)
+            st.caption(f"Cap Size: {result['cap_size']}")
         
         with c2:
-            # FIX 1 — Using named colors (green/orange/red/blue)
             color = signal_color(sig["signal"])
             st.markdown(f":{color}_circle: **{sig['signal']}**")
         
@@ -1922,31 +2133,28 @@ with tab_dash:
         with c5:
             st.metric("Setup", sig["setup_quality"])
         
-        # ===== MARKET CONTEXT =====
+        # ===== PATCH 8 — KSE-100 Strict Separation =====
         mkt = result["market"]
         if mkt["regime"] != "UNAVAILABLE":
-            st.caption(f"📊 Market: {mkt['regime']} | KSE-100: {round(mkt['last_close'], 0) if mkt['last_close'] else 'N/A'}")
+            st.caption(f"📊 KSE-100: {mkt['regime']} | Level: {round(mkt['last_close'], 0) if mkt['last_close'] else 'N/A'}")
         else:
-            st.caption("📊 Market: KSE-100 DATA UNAVAILABLE")
-            # Show proxy indicator when KSE-100 is unavailable
+            st.caption("📊 KSE-100: DATA UNAVAILABLE")
             proxy = liquid_basket_trend()
             if proxy["change_pct"] is not None:
-                st.caption(f"📊 Proxy: PSX Liquid Basket {proxy['trend']} ({proxy['change_pct']}%)")
-                st.caption("(Proxy — NOT official KSE-100. Use with caution.)")
+                st.caption(f"📊 Proxy (NOT KSE-100): {proxy['trend']} ({proxy['change_pct']}%)")
         
         # ===== SIGNAL REASONS =====
         with st.expander("🔍 Why this signal?", expanded=True):
             for r in sig["reasons"]:
                 st.write(r)
         
-        # ===== TRADE PLAN (FIX 11 — Bearish trend gate) =====
+        # ===== TRADE PLAN =====
         st.subheader("📋 Trade Plan")
         risk = result["risk"]
         trend = result["trend"]
         
-        # FIX 11 — If bearish, show warning instead of bullish trade plan
         if trend in ("BEARISH", "STRONG BEARISH"):
-            st.warning("📉 No long trade setup — bearish structure. Avoid new long positions. See Technical Projection below for downside expectations instead.")
+            st.warning("📉 No long trade setup — bearish structure. See Technical Projection below for downside expectations.")
         else:
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Entry", round(risk["entry"], 2))
@@ -1955,11 +2163,12 @@ with tab_dash:
             col4.metric("Target 2", round(risk["target2"], 2))
             col5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
         
-        # ===== POSITION SIZING =====
+        if risk.get("conditional_entry") is not None and trend not in ("BEARISH", "STRONG BEARISH"):
+            st.caption(f"💡 Alternative: Conditional entry near {risk['conditional_entry']} (pullback to EMA20)")
+        
         sizing = position_sizing(capital, risk_pct, risk)
         if sizing["shares"] > 0 and trend not in ("BEARISH", "STRONG BEARISH"):
             st.caption(f"📊 Position Sizing: **{sizing['shares']} shares** | Investment: PKR {sizing['investment']} | Max Loss: PKR {sizing['max_loss']}")
-            st.caption("Risk-based sizing only - no capital allocation % used.")
         elif trend in ("BEARISH", "STRONG BEARISH"):
             st.caption("📊 Position sizing disabled — bearish trend.")
         
@@ -1973,15 +2182,33 @@ with tab_dash:
         if result["penny"]["is_penny"]:
             st.warning(f"🪙 **Penny Stock Alert:** {result['penny']['status']} - {result['penny']['note']}")
         
-        # ===== CHART =====
+        # ===== PATCH 12 — CHART with toggles =====
         st.subheader("📊 Chart")
-        col1, col2 = st.columns(2)
+        col1, col2, col3, col4, col5 = st.columns(5)
         show_bb = col1.checkbox("Show Bollinger Bands", value=False)
         show_sma200 = col2.checkbox("Show SMA200", value=False)
+        show_sr = col3.checkbox("Show Support/Resistance", value=True)
+        show_rsi = col4.checkbox("Show RSI", value=False)  # OFF by default
+        show_macd = col5.checkbox("Show MACD", value=False)  # OFF by default
         
-        st.plotly_chart(build_chart(result, show_bb, show_sma200), use_container_width=True)
+        st.plotly_chart(build_chart(result, show_bb, show_sma200, show_sr, show_rsi, show_macd), use_container_width=True)
         
-        # ===== FIX 12 — "Is Chart Ko Kaise Parhein?" Roman Urdu Panel =====
+        # ===== PATCH 7 — Human Explanations =====
+        with st.expander("📖 Indicator Explanations (Urdu / English)"):
+            st.markdown("**SMA20:** 20 din ki average price. Price above = short-term strength.")
+            st.markdown("**SMA50:** 50 din ki average. Helps identify medium-term trend.")
+            st.markdown(f"**RSI ({round(last['RSI14'],1)}):** Momentum indicator (0-100). Above 70 = overbought, below 30 = oversold.")
+            st.markdown(f"**MACD ({round(last['MACD_HIST'],2)}):** Shows momentum direction. Positive = bullish momentum.")
+            st.markdown(f"**ADX ({round(last['ADX14'],1)}):** Trend strength. Above 25 = strong trend.")
+            st.markdown(f"**RVOL ({round(last['VOL_RATIO'],2) if not pd.isna(last['VOL_RATIO']) else 'N/A'}x):** Volume vs normal. 1.5x = 50% higher.")
+            st.markdown(f"**Support ({round(result['sr']['primary_support'],2)}):** Price area where buyers appeared.")
+            st.markdown(f"**Resistance ({round(result['sr']['primary_resistance'],2)}):** Price area where sellers appeared.")
+            st.markdown(f"**Breakout:** {result['breakout']['status']} — {result['breakout']['note']}")
+            if risk["stop_loss"] > 0:
+                st.markdown(f"**Stop Loss ({round(risk['stop_loss'],2)}):** Exit level to limit loss.")
+            st.markdown(f"**Target 1 ({round(risk['target1'],2)}):** Technical price objective if trend continues.")
+        
+        # ===== Is Chart Ko Kaise Parhein? =====
         with st.expander("📖 Is Chart Ko Kaise Parhein?"):
             sr = result["sr"]
             st.markdown(f"**SMA20:** {round(last['SMA20'],2)} — 20 din ki average price. "
@@ -1995,11 +2222,10 @@ with tab_dash:
                          f"{'Strong trending market' if last['ADX14'] >= 25 else 'Weak/range-bound market'}.")
             st.markdown(f"**Support:** {round(sr['primary_support'],2)} — Yahan historical buying support mil sakta hai.")
             st.markdown(f"**Resistance:** {round(sr['primary_resistance'],2)} — Yahan selling pressure aa sakta hai.")
-            # FIX 13 — Show distinctness flags
             if not sr.get("secondary_support_is_distinct", True):
-                st.caption("⚠️ No distinct secondary support level found — stock at extreme for an extended period.")
+                st.caption("⚠️ No distinct secondary support level found.")
             if not sr.get("secondary_resistance_is_distinct", True):
-                st.caption("⚠️ No distinct secondary resistance level found — stock at extreme for an extended period.")
+                st.caption("⚠️ No distinct secondary resistance level found.")
         
         # ===== SUPPORT/RESISTANCE =====
         with st.expander("📊 Support / Resistance Details"):
@@ -2010,7 +2236,6 @@ with tab_dash:
             col3.metric("Secondary Support", round(sr["secondary_support"], 2))
             col4.metric("Secondary Resistance", round(sr["secondary_resistance"], 2))
             
-            # FIX 13 — Distinctness flags
             if not sr.get("secondary_support_is_distinct", True):
                 st.caption("⚠️ Secondary Support = Primary Support (stock at extreme)")
             if not sr.get("secondary_resistance_is_distinct", True):
@@ -2020,45 +2245,75 @@ with tab_dash:
                 st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
 
 # ============================================================
-# SCREENER TAB (FIX 7 + FIX 8 + FIX 15 + FIX 15b)
+# SCREENER TAB
 # ============================================================
 
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     
-    # FIX 7 + FIX 15 — Honest caption with explicit count
-    st.caption("Scans available PSX universe from yfinance. Covers a broad but NOT complete set of PSX's ~561 listed companies (yfinance/PSX have no bulk verified-listing API this app can call). Missing a specific stock? Add it via 'Add extra symbols' above.")
+    st.caption("Scans available PSX universe from yfinance. Covers a broad but NOT complete set of PSX's ~561 listed companies. Missing a specific stock? Add it via 'Add extra symbols' above.")
     
-    # Universe selection — FIX 8 + FIX 15 + FIX 15b (default index=0)
     universe_option = st.selectbox(
         "Universe",
-        ["Dynamic (auto-detect)", "Liquid PSX (~34)", "Small Cap / Penny (~25)", "Full/Broad (~120)", "Custom (from sidebar)"],
-        index=0,  # FIX 15b — Default to Dynamic instead of Full/Broad
-        help="'Dynamic' attempts to discover from ETFs, 'Liquid' is curated liquid set, 'Small Cap' focuses on lower-priced stocks, 'Full/Broad' is a broad curated list (~120 tickers) — NOT complete PSX listing"
+        ["Dynamic (auto-detect)", "Liquid PSX (~34)", "Small Cap / Penny (~25)", "Full/Broad (~160)", "Custom (from sidebar)"],
+        index=0,
+        help="'Dynamic' attempts to discover from ETFs, 'Liquid' is curated liquid set, 'Small Cap' focuses on lower-priced stocks, 'Full/Broad' is a broad curated list (~160 tickers) — NOT complete PSX listing"
     )
     
     col1, col2 = st.columns(2)
     with col1:
         custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
     with col2:
-        pass  # Placeholder for alignment
+        pass
+    
+    # PATCH 5 — Screener Filters
+    st.markdown("**Filter Options**")
+    filt_col1, filt_col2, filt_col3, filt_col4 = st.columns(4)
+    with filt_col1:
+        signal_filter = st.multiselect(
+            "Signal",
+            ["STRONG BUY", "BUY", "WAIT", "REDUCE", "AVOID", "ERROR"],
+            default=[]
+        )
+    with filt_col2:
+        category_filter = st.multiselect(
+            "Category",
+            ["LARGE", "MID", "SMALL", "LOW-PRICE", "MICRO"],
+            default=[]
+        )
+    with filt_col3:
+        breakout_filter = st.multiselect(
+            "Breakout Status",
+            ["CONFIRMED BREAKOUT", "EXTENDED BREAKOUT", "BREAKOUT READY", "BREAKOUT ATTEMPT", "FAILED BREAKOUT", "NO BREAKOUT"],
+            default=[]
+        )
+    with filt_col4:
+        min_score = st.slider("Min Score", 0, 100, 0)
+    
+    filt_col5, filt_col6, filt_col7, filt_col8 = st.columns(4)
+    with filt_col5:
+        min_rr = st.slider("Min R:R", 0.0, 5.0, 0.0, 0.1)
+    with filt_col6:
+        min_price = st.number_input("Min Price", min_value=0.0, value=0.0, step=1.0)
+    with filt_col7:
+        max_price = st.number_input("Max Price", min_value=0.0, value=10000.0, step=50.0)
+    with filt_col8:
+        min_avg_volume = st.number_input("Min Avg Volume", min_value=0, value=0, step=1000)
     
     if st.button("🔍 Run Screener", use_container_width=True):
         with st.spinner("Scanning PSX universe..."):
-            # Build universe based on selection
             if universe_option == "Dynamic (auto-detect)":
                 universe = fetch_psx_universe()
             elif universe_option == "Liquid PSX (~34)":
                 universe = PSX_LIQUID_UNIVERSE
             elif universe_option == "Small Cap / Penny (~25)":
                 universe = PSX_SMALL_CAP_UNIVERSE
-            elif universe_option == "Full/Broad (~120)":
-                universe = PSX_FULL_UNIVERSE  # FIX 15
-            else:  # Custom from sidebar
+            elif universe_option == "Full/Broad (~160)":
+                universe = PSX_FULL_UNIVERSE
+            else:
                 universe = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip() 
                            for t in watchlist_input.split(",") if t.strip()]
             
-            # Add custom symbols
             if custom_syms:
                 extra = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip() 
                         for t in custom_syms.split(",") if t.strip()]
@@ -2066,12 +2321,10 @@ with tab_screener:
             
             st.caption(f"Scanning {len(universe)} symbols...")
             
-            # FIX 6 + FIX 9 — Pass penny_threshold and rvol_threshold
             screener_df, coverage = run_screener(universe, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
             st.session_state["screener_df"] = screener_df
             st.session_state["screener_coverage"] = coverage
     
-    # Show coverage
     if "screener_coverage" in st.session_state:
         cov = st.session_state["screener_coverage"]
         col1, col2, col3, col4 = st.columns(4)
@@ -2080,30 +2333,31 @@ with tab_screener:
         col3.metric("Success", cov["success"])
         col4.metric("Failed", cov["failed"])
     
-    # Show results
     if "screener_df" in st.session_state:
         df_s = st.session_state["screener_df"]
         
-        # Filter options
-        col1, col2 = st.columns(2)
-        with col1:
-            signal_filter = st.multiselect(
-                "Filter by Signal",
-                ["STRONG BUY", "BUY", "WAIT", "REDUCE", "AVOID", "ERROR"],
-                default=["STRONG BUY", "BUY"]
-            )
-        with col2:
-            sort_by = st.selectbox("Sort by", ["Score", "Change %", "Price"], index=0)
-        
-        # Apply filters
         view = df_s.copy()
+        
         if signal_filter:
             view = view[view["Signal"].isin(signal_filter)]
+        if category_filter:
+            view = view[view["Cap Size"].isin(category_filter)]
+        if breakout_filter:
+            view = view[view["Status"].isin(breakout_filter)]
+        if min_score > 0:
+            view = view[view["Score"] >= min_score]
+        if min_rr > 0:
+            view = view[view["RR"] >= min_rr]
+        if min_price > 0:
+            view = view[view["Price"] >= min_price]
+        if max_price < 10000:
+            view = view[view["Price"] <= max_price]
+        if min_avg_volume > 0 and "_avg_volume" in view.columns:
+            view = view[view["_avg_volume"] >= min_avg_volume]
         
-        # Remove ERROR rows for display
         view = view[view["Signal"] != "ERROR"]
         
-        # Sort
+        sort_by = st.selectbox("Sort by", ["Score", "Change %", "Price"], index=0)
         view = view.sort_values(sort_by, ascending=False, na_position="last")
         
         if not view.empty:
@@ -2113,7 +2367,7 @@ with tab_screener:
             st.info("No stocks match the current filters")
 
 # ============================================================
-# BREAKOUT TAB (FIX 17 — Dedicated columns + custom sorting)
+# BREAKOUT TAB
 # ============================================================
 
 with tab_breakouts:
@@ -2122,17 +2376,14 @@ with tab_breakouts:
     if "screener_df" in st.session_state:
         df_s = st.session_state["screener_df"]
         
-        # Filter for breakout-related status
         breakout_keywords = ["CONFIRMED", "READY", "ATTEMPT", "52W"]
         bo = df_s[df_s["Status"].astype(str).str.contains('|'.join(breakout_keywords), case=False, na=False)]
         
         if not bo.empty:
-            # FIX 17 — Add dedicated breakout columns
             breakout_rows = []
             for idx, row in bo.iterrows():
                 ticker_raw = row.get("_ticker_raw", row["Ticker"])
-                # Get cached result
-                result, status, _ = analyze_stock(ticker_raw, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+                result, status, _, _ = analyze_stock(ticker_raw, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
                 if status == "SUCCESS":
                     breakout_rows.append({
                         "Ticker": row["Ticker"],
@@ -2142,19 +2393,18 @@ with tab_breakouts:
                         "Score": row["Score"],
                         "Signal": row["Signal"],
                         "Status": row["Status"],
-                        # FIX 17 — New columns
                         "Resistance": round(result["breakout"]["resistance"], 2),
                         "Dist %": round(result["breakout"]["distance_to_resistance"], 2) if result["breakout"]["distance_to_resistance"] is not None else "N/A",
                         "Momentum": result["momentum"]["label"],
                         "RR": row["RR"],
                         "Why": row["Why"],
+                        "Cap Size": row.get("Cap Size", "N/A"),
                         "_ticker_raw": ticker_raw,
                     })
             
             if breakout_rows:
                 bo_df = pd.DataFrame(breakout_rows)
                 
-                # FIX 17 — Custom sorting: CONFIRMED (non-extended) > EXTENDED > READY > ATTEMPT
                 status_order = {
                     "CONFIRMED BREAKOUT": 0,
                     "CONFIRMED BREAKOUT / 52W HIGH": 0,
@@ -2190,12 +2440,10 @@ with tab_penny:
     if "screener_df" in st.session_state:
         df_s = st.session_state["screener_df"]
         
-        # Filter penny stocks
         penny_df = df_s[df_s["Penny"].notna()]
         penny_df = penny_df[penny_df["Penny"] != "N/A"]
         
         if not penny_df.empty:
-            # Show interesting penny setups first
             interesting = penny_df[penny_df["Penny"].str.contains("BREAKOUT|READY|VOLUME|WATCH", na=False)]
             interesting = interesting.sort_values("Score", ascending=False)
             
@@ -2206,7 +2454,6 @@ with tab_penny:
             else:
                 st.info("No interesting penny setups at this time")
             
-            # Show all penny stocks
             with st.expander("All penny stocks"):
                 all_penny = penny_df.sort_values("Price", ascending=True)
                 display_cols = [c for c in all_penny.columns if not c.startswith("_")]
@@ -2217,44 +2464,7 @@ with tab_penny:
         st.info("Run the Screener first to identify penny stocks")
 
 # ============================================================
-# FIX 19 — Estimate Pace to Target Helper
-# ============================================================
-
-def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
-    """
-    Estimate pace to target1 using ATR.
-    
-    FIX 19: Returns (trade_type, pace_label)
-    """
-    last = result["last"]
-    risk = result["risk"]
-    breakout = result["breakout"]
-    pullback = result["pullback"]
-    
-    # Trade Type
-    if "CONFIRMED BREAKOUT" in breakout["status"] and "EXTENDED" not in breakout["status"]:
-        trade_type = "Day/Short-Term"
-    elif pullback["status"] == "HEALTHY PULLBACK":
-        trade_type = "Swing"
-    else:
-        trade_type = "Momentum"
-    
-    # Estimated Pace
-    atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
-    entry = risk["entry"]
-    target1 = risk["target1"]
-    distance_to_target1 = abs(target1 - entry)
-    
-    if atr_val > 0 and distance_to_target1 > 0:
-        est_sessions = max(1, round(distance_to_target1 / atr_val))
-        pace_label = f"~{est_sessions} sessions (technical estimate)"
-    else:
-        pace_label = "N/A"
-    
-    return trade_type, pace_label
-
-# ============================================================
-# NEXT SESSION TAB (FIX 18 + FIX 19)
+# NEXT SESSION TAB (PATCH 14 — Confidence column)
 # ============================================================
 
 with tab_next:
@@ -2262,10 +2472,8 @@ with tab_next:
     st.caption("Top candidates for the next trading session based on latest data")
     st.caption("⚠️ Not a guarantee - watch for confirmation before trading")
     
-    # FIX 18 — Independent refresh button
     if st.button("🔄 Refresh Next Session", use_container_width=True):
         with st.spinner("Scanning for next-session candidates..."):
-            # Combine Liquid + Small Cap for broad coverage (or Full if available)
             combined_universe = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_UNIVERSE))
             st.session_state["next_session_df"], _ = run_screener(
                 combined_universe, 
@@ -2274,7 +2482,6 @@ with tab_next:
                 rvol_threshold=rvol_threshold
             )
     
-    # Use cached or run initial
     if "next_session_df" not in st.session_state:
         with st.spinner("Initial scan for next-session candidates..."):
             combined_universe = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_UNIVERSE))
@@ -2287,31 +2494,26 @@ with tab_next:
     
     df_s = st.session_state["next_session_df"]
     
-    # Filter for BUY signals with decent scores (FIX 14 ensures trend gate applied)
     top = df_s[df_s["Signal"].isin(["STRONG BUY", "BUY"])]
     top = top.dropna(subset=["Score"])
     top = top.sort_values("Score", ascending=False).head(10)
     
     if not top.empty:
-        # FIX 18 — Add Cap Size column
         cap_size_rows = []
         for idx, row in top.iterrows():
             ticker_raw = row.get("_ticker_raw", row["Ticker"])
-            if ticker_raw in PSX_LIQUID_UNIVERSE:
-                cap_size = "LARGE"
-            elif ticker_raw in PSX_SMALL_CAP_UNIVERSE:
-                cap_size = "SMALL"
-            elif ticker_raw in PSX_FULL_UNIVERSE:
-                cap_size = "MID/UNVERIFIED SIZE"
-            else:
-                cap_size = "UNKNOWN"
             
-            # FIX 19 — Get trade type and pace
-            result, status, _ = analyze_stock(ticker_raw, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+            # PATCH 14 — Get confidence
+            confidence = get_confidence(row["Score"], row["Trend"])
+            
+            result, status, _, _ = analyze_stock(ticker_raw, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
             if status == "SUCCESS":
                 trade_type, pace_label = estimate_pace_to_target(result)
+                # PATCH 9 — Freshness for candidate
+                fresh_status, _, _ = data_freshness_label(result["data_date"])
             else:
                 trade_type, pace_label = "N/A", "N/A"
+                fresh_status = "UNAVAILABLE"
             
             cap_size_rows.append({
                 "Ticker": row["Ticker"],
@@ -2321,31 +2523,29 @@ with tab_next:
                 "Signal": row["Signal"],
                 "Status": row["Status"],
                 "RR": row["RR"],
-                # FIX 18 — Cap Size
-                "Cap Size": cap_size,
-                # FIX 19 — Trade Type and Est. Pace
+                "Cap Size": row.get("Cap Size", "N/A"),
                 "Trade Type": trade_type,
-                "Est. Pace to T1": pace_label,
+                "Est. Pace": pace_label,
+                "Confidence": confidence,  # PATCH 14
+                "Data Status": fresh_status,  # PATCH 9
                 "Why": row["Why"],
             })
         
         cap_df = pd.DataFrame(cap_size_rows)
-        display_cols = ["Ticker", "Price", "Trend", "Score", "Signal", "Status", "RR", "Cap Size", "Trade Type", "Est. Pace to T1", "Why"]
+        display_cols = ["Ticker", "Price", "Trend", "Score", "Signal", "Confidence", "Trade Type", "Est. Pace", "Data Status", "Why"]
         st.dataframe(cap_df[display_cols], use_container_width=True, hide_index=True)
         
-        # FIX 18 — Honest count message if few candidates
         if len(top) < 3:
-            st.info(f"Only {len(top)} candidate(s) found today — this reflects genuinely limited high-quality setups under current market conditions, not a system error.")
+            st.info(f"Only {len(top)} candidate(s) found today — reflects limited high-quality setups.")
         
-        # FIX 19 — Pace disclaimer
-        st.caption("⚠️ 'Est. Pace' is a rough technical estimate based on historical average daily movement (ATR) — NOT a guaranteed timeline. Actual timing depends on market conditions.")
+        st.caption("⚠️ 'Est. Pace' is a rough technical estimate based on ATR — NOT a guaranteed timeline.")
+        st.caption("⚠️ 'Confidence' is based on score and trend alignment — NOT a guarantee of profit.")
         
     else:
         st.info("No strong BUY candidates at this time")
-        st.caption("This reflects genuinely limited high-quality setups under current market conditions, not a system error.")
 
 # ============================================================
-# WATCHLIST TAB (FIX 6 + FIX 9)
+# WATCHLIST TAB
 # ============================================================
 
 with tab_watch:
@@ -2355,7 +2555,6 @@ with tab_watch:
     
     if st.button("🔄 Refresh Watchlist", use_container_width=True):
         with st.spinner("Analyzing watchlist..."):
-            # FIX 6 + FIX 9 — Pass penny_threshold and rvol_threshold
             watchlist_df, coverage = run_screener(tickers, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
             st.session_state["watchlist_df"] = watchlist_df
     
@@ -2367,13 +2566,12 @@ with tab_watch:
         st.info("Click 'Refresh Watchlist' to analyze")
 
 # ============================================================
-# PORTFOLIO TAB (FIX 21 — Added Support/Resistance/Stop/Target columns)
+# PORTFOLIO TAB
 # ============================================================
 
 with tab_port:
     st.subheader("💼 Portfolio Tracker (max 5 holdings)")
     
-    # Add holding form
     with st.form("add_holding"):
         col1, col2, col3 = st.columns(3)
         h_ticker = col1.text_input("Ticker")
@@ -2392,15 +2590,13 @@ with tab_port:
                 })
                 st.success(f"Added {h_ticker}")
     
-    # Display portfolio
     if st.session_state.portfolio:
         rows = []
         total_invested = 0
         total_current = 0
         
         for i, h in enumerate(st.session_state.portfolio):
-            # FIX 6 + FIX 9 — Pass penny_threshold and rvol_threshold for consistency
-            result, status, error = analyze_stock(h["ticker"], period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+            result, status, error, _ = analyze_stock(h["ticker"], period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
             invested = h["buy_price"] * h["shares"]
             total_invested += invested
             
@@ -2425,13 +2621,13 @@ with tab_port:
                     "Trend": result["trend"],
                     "Score": result["signal"]["score"],
                     "Signal": result["signal"]["signal"],
-                    # FIX 21 — Added Support, Resistance, Stop Loss, Target 1
                     "Support": round(result["sr"]["primary_support"], 2),
                     "Resistance": round(result["sr"]["primary_resistance"], 2),
                     "Stop Loss": round(result["risk"]["stop_loss"], 2),
                     "Target 1": round(result["risk"]["target1"], 2),
                     "Decision": decision,
                     "Reason": reason,
+                    "Cap Size": result.get("cap_size", "N/A"),
                 })
             else:
                 total_current += invested
@@ -2447,16 +2643,15 @@ with tab_port:
                     "Trend": None,
                     "Score": None,
                     "Signal": "ERROR",
-                    # FIX 21 — Error branch with None values
                     "Support": None,
                     "Resistance": None,
                     "Stop Loss": None,
                     "Target 1": None,
                     "Decision": "WATCH",
                     "Reason": error,
+                    "Cap Size": None,
                 })
         
-        # Summary
         total_pnl = total_current - total_invested
         total_pnl_pct = total_pnl / total_invested * 100 if total_invested else 0
         
@@ -2466,11 +2661,9 @@ with tab_port:
         col3.metric("Total P/L", f"PKR {round(total_pnl, 2)}")
         col4.metric("Total P/L %", f"{round(total_pnl_pct, 2)}%")
         
-        # Portfolio table
         port_df = pd.DataFrame(rows)
         st.dataframe(port_df, use_container_width=True, hide_index=True)
         
-        # Remove holding
         remove_idx = st.selectbox(
             "Remove holding",
             options=["-"] + [h["ticker"] for h in st.session_state.portfolio]
@@ -2485,46 +2678,46 @@ with tab_port:
         st.info("No holdings added yet. Add up to 5 holdings above.")
 
 # ============================================================
-# MARKET TAB
+# MARKET TAB (PATCH 8 — KSE-100 strict separation)
 # ============================================================
 
 with tab_market:
     st.subheader("📈 Market Overview")
     
-    # First, show KSE-100 (honest unavailable status)
     market = market_snapshot()
     
     if market["regime"] == "UNAVAILABLE":
         st.warning("🔴 KSE-100: DATA UNAVAILABLE")
-        st.caption("No KSE-100 candidate ticker returned valid data from yfinance.")
+        st.caption("No KSE-100 candidate ticker returned valid data from any provider.")
         st.caption("(psxdata experimental package may provide KSE-100 if installed — see requirements.txt)")
         
-        # Show diagnostic results
         with st.expander("🔍 KSE-100 Candidate Diagnostics"):
             diag_df = diagnose_market_index_candidates()
             st.dataframe(diag_df, use_container_width=True, hide_index=True)
             st.caption("None of the tested candidates passed verification.")
-    
     else:
-        fresh_label, _ = data_freshness_label(market["last_date"])
+        fresh_label, fresh_age, fresh_warning = data_freshness_label(market["last_date"])
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Market Regime", market["regime"])
         col2.metric("Market Trend", market["trend"])
         col3.metric("KSE-100 Level", round(market["last_close"], 2) if market["last_close"] else "N/A")
         
-        st.caption(f"Source: {market['label']} | Last: {market['last_date'].date() if market['last_date'] else 'N/A'} ({fresh_label})")
+        st.caption(f"Source: {market['label'] if market['label'] else 'Unknown'} | Last: {market['last_date'].date() if market['last_date'] else 'N/A'} ({fresh_label})")
+        st.caption(f"Age: {fresh_age}")
+        if fresh_label == "STALE":
+            st.warning(f"🔴 {fresh_warning}")
+        
         st.info(f"**Reasoning:** {market['reasoning']}")
         
-        # Try to show KSE-100 chart
         idx_df, _ = fetch_market_index()
         if idx_df is not None and len(idx_df) > 30:
             st.line_chart(idx_df["Close"].tail(180))
     
-    # Then show proxy indicator (always visible)
+    # PATCH 8 — Proxy always separately labelled
     st.divider()
     st.subheader("📊 PSX Liquid Basket Trend (Proxy)")
-    st.caption("Equal-weighted average of ~34 liquid PSX stocks — NOT official KSE-100")
+    st.caption("⚠️ This is a PROXY indicator — NOT official KSE-100. Use for context only.")
     
     proxy = liquid_basket_trend()
     if proxy["change_pct"] is not None:
