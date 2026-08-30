@@ -12,6 +12,12 @@ Key Improvements in v3.0:
 - Data freshness everywhere
 - Professional UI redesign
 - Provider diagnostics panel
+- Universe deduplication (FIX 32)
+- Conditional entry display (FIX 33)
+- Chart trend label (FIX 34)
+- Prominent stale data warning (FIX 35)
+- Alternative KSE-100 sources (FIX 36)
+- Scanner performance optimization (FIX 37)
 """
 
 import streamlit as st
@@ -430,6 +436,10 @@ def fetch_psxdata_kse100() -> Tuple[Optional[pd.DataFrame], str, str]:
         update_provider_status("psxdata", available=True, error=str(e))
         return None, "psxdata (error)", str(e)
 
+# ============================================================
+# FIX 32 + FIX 37 — UNIVERSE DEDUPLICATION & PERFORMANCE
+# ============================================================
+
 def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
     try:
         import psxdata
@@ -458,15 +468,24 @@ def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
         if tickers is None or len(tickers) == 0:
             return None, "psxdata (no tickers)", "No tickers from psxdata"
         
+        # FIX 32 + FIX 37 — Deduplicate and filter only .KA tickers
         if isinstance(tickers, list):
-            formatted = []
-            for t in tickers:
-                if isinstance(t, str):
-                    if not t.endswith(".KA"):
-                        formatted.append(t + ".KA")
-                    else:
-                        formatted.append(t)
-            tickers = formatted
+            # Keep only .KA tickers
+            ka_tickers = [t for t in tickers if isinstance(t, str) and t.endswith(".KA")]
+            # Deduplicate
+            unique_tickers = list(dict.fromkeys(ka_tickers))
+            if len(unique_tickers) > 0:
+                tickers = unique_tickers
+            else:
+                # Fallback: format all tickers
+                formatted = []
+                for t in tickers:
+                    if isinstance(t, str):
+                        if not t.endswith(".KA"):
+                            formatted.append(t + ".KA")
+                        else:
+                            formatted.append(t)
+                tickers = list(dict.fromkeys(formatted))
         
         update_provider_status("psxdata", coverage=len(tickers))
         return tickers, "psxdata", None
@@ -565,18 +584,16 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame]
     return None, "EXCEPTION", "No provider could fetch data for this ticker", "UNAVAILABLE"
 
 # ============================================================
-# MASTER fetch_market_index() (FIX 29 REMOVED — legal compliance)
+# MASTER fetch_market_index() (FIX 36 — Alternative KSE-100 sources)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
     """
-    Fetch KSE-100 data. Tries:
+    Fetch KSE-100 data. Tries multiple sources:
     1. psxdata (experimental)
-    2. yfinance candidates (fallback)
-    
-    REMOVED: dps.psx.com.pk scraper (legal risk — PSX Terms of Use
-    prohibit spiders/robots without written permission)
+    2. psx-data-hub (if available)
+    3. yfinance candidates (fallback)
     
     NEVER blocks the app if any provider fails.
     """
@@ -605,7 +622,38 @@ def fetch_market_index():
         pass
     
     # ============================================================
-    # 2. Fallback: yfinance candidates
+    # 2. FIX 36 — Try alternative psx-data-hub
+    # ============================================================
+    try:
+        import requests
+        response = requests.get("https://psx-data-hub.vercel.app/api/v1/indices/KSE100", timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                inner = data["data"]
+                if isinstance(inner, list) and len(inner) > 0:
+                    df = pd.DataFrame(inner)
+                    if "Close" in df.columns or "close" in df.columns:
+                        if "close" in df.columns:
+                            df = df.rename(columns={"close": "Close"})
+                        df = df[["Close"]].dropna()
+                        if len(df) > 20:
+                            # Try to parse dates
+                            if "date" in df.columns or "Date" in df.columns:
+                                date_col = "date" if "date" in df.columns else "Date"
+                                df.index = pd.to_datetime(df[date_col])
+                                df = df.drop(columns=[date_col])
+                            last_close = float(df["Close"].iloc[-1])
+                            if KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX:
+                                daily_vol = df["Close"].pct_change().std()
+                                if not pd.isna(daily_vol) and daily_vol <= 0.06:
+                                    update_provider_status("psxdata", available=True, kse100=True)
+                                    return df, "psx-data-hub (KSE100)"
+    except Exception:
+        pass
+    
+    # ============================================================
+    # 3. Fallback: yfinance candidates
     # ============================================================
     for cand in MARKET_INDEX_CANDIDATES:
         try:
@@ -638,13 +686,14 @@ def fetch_market_index():
     return None, None
 
 # ============================================================
-# MASTER UNIVERSE FETCH
+# MASTER UNIVERSE FETCH (FIX 32 + FIX 37)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_universe() -> Tuple[List[str], str, str]:
     tickers, source, error = fetch_psxdata_universe()
     if tickers is not None and len(tickers) > 10:
+        # FIX 32 — Already deduplicated in fetch_psxdata_universe
         return tickers, source, None
     
     return PSX_FALLBACK_UNIVERSE, "curated fallback", None
@@ -1827,13 +1876,14 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     return "HOLD", "No clear signal - maintain position"
 
 # ============================================================
-# CHART (FIX: Parentheses balanced — syntax error corrected)
+# CHART (FIX 34 — Trend direction label on chart)
 # ============================================================
 
 def build_chart(result, show_bb=False, show_sma200=False, show_support_resistance=True, show_rsi=False, show_macd=False):
     d = result["df"].tail(150)
     risk = result["risk"]
     sr = result["sr"]
+    trend = result["trend"]
     
     num_rows = 1
     if show_rsi:
@@ -1872,7 +1922,22 @@ def build_chart(result, show_bb=False, show_sma200=False, show_support_resistanc
         name="Price", increasing_line_color="#10B981", decreasing_line_color="#EF4444"
     ), row=current_row, col=1)
     
-    # SMA20 — FIXED: removed extra closing parenthesis
+    # FIX 34 — Trend direction annotation
+    trend_color = "#10B981" if trend in ("BULLISH", "STRONG BULLISH") else "#EF4444" if trend in ("BEARISH", "STRONG BEARISH") else "#F59E0B"
+    trend_arrow = "↑" if trend in ("BULLISH", "STRONG BULLISH") else "↓" if trend in ("BEARISH", "STRONG BEARISH") else "→"
+    fig.add_annotation(
+        x=0.02, y=0.98, xref="paper", yref="paper",
+        text=f"{trend_arrow} TREND: {trend}",
+        showarrow=False,
+        font=dict(color=trend_color, size=14, family="monospace"),
+        bgcolor="rgba(14, 17, 23, 0.8)",
+        bordercolor=trend_color,
+        borderwidth=1,
+        borderpad=4,
+        opacity=0.9
+    )
+    
+    # SMA20
     fig.add_trace(go.Scatter(
         x=d.index, y=d["SMA20"], line=dict(color="#3B82F6", width=1.2), name="SMA20"
     ), row=current_row, col=1)
@@ -1962,6 +2027,17 @@ def get_signal_class(signal):
         return "signal-wait"
     else:
         return "signal-avoid"
+
+# ============================================================
+# FIX 35 — Prominent Stale Data Warning
+# ============================================================
+
+def show_stale_data_warning(freshness_status, freshness_warning):
+    if freshness_status == "STALE":
+        st.warning(f"🔴 {freshness_warning}")
+        st.caption("⚠️ Data is stale. Signal confidence reduced. Please refresh or use a different data source.")
+    elif freshness_status == "DELAYED":
+        st.info(f"⚠️ {freshness_warning}")
 
 # ============================================================
 # SIDEBAR
@@ -2061,7 +2137,7 @@ tab_dash, tab_screener, tab_breakouts, tab_penny, tab_next, tab_watch, tab_port,
 ])
 
 # ============================================================
-# DASHBOARD TAB
+# DASHBOARD TAB (FIX 33 + FIX 35)
 # ============================================================
 
 with tab_dash:
@@ -2081,6 +2157,9 @@ with tab_dash:
         
         # Data Freshness
         freshness_status, freshness_age, freshness_warning = get_freshness_status(result["data_date"])
+        
+        # FIX 35 — Prominent stale data warning
+        show_stale_data_warning(freshness_status, freshness_warning)
         
         # Header row: Ticker, Price, Signal, Score, Trend
         col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.2, 1.2, 1.2])
@@ -2127,7 +2206,9 @@ with tab_dash:
             for r in sig["reasons"]:
                 st.write(r)
         
-        # Trade Plan
+        # ============================================================
+        # FIX 33 — Conditional Entry Display
+        # ============================================================
         st.subheader("📋 Trade Plan")
         risk = result["risk"]
         trend = result["trend"]
@@ -2135,15 +2216,18 @@ with tab_dash:
         if trend in ("BEARISH", "STRONG BEARISH"):
             st.warning("📉 No long trade setup — bearish structure.")
         else:
+            # Main entry
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Entry", round(risk["entry"], 2))
             col2.metric("Stop Loss", round(risk["stop_loss"], 2))
             col3.metric("Target 1", round(risk["target1"], 2))
             col4.metric("Target 2", round(risk["target2"], 2))
             col5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
-        
-        if risk.get("conditional_entry") is not None and trend not in ("BEARISH", "STRONG BEARISH"):
-            st.caption(f"💡 Conditional entry: {risk['conditional_entry']} (pullback to EMA20)")
+            
+            # FIX 33 — Show conditional entry if available
+            if risk.get("conditional_entry") is not None:
+                st.caption(f"💡 **Better Entry Alternative:** {risk['conditional_entry']} (pullback to EMA20) — better R:R than current price.")
+                st.caption(f"   Current price: {round(risk['entry'], 2)} | Conditional: {risk['conditional_entry']} | Save: {round(risk['entry'] - risk['conditional_entry'], 2)} per share")
         
         sizing = position_sizing(capital, risk_pct, risk)
         if sizing["shares"] > 0 and trend not in ("BEARISH", "STRONG BEARISH"):
@@ -2202,13 +2286,14 @@ with tab_dash:
                 st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
 
 # ============================================================
-# SCREENER TAB (FIX 31 — Min Avg Volume filter wired)
+# SCREENER TAB (FIX 32 + FIX 37 — Deduplicated universe)
 # ============================================================
 
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     
-    st.caption("Scans available PSX universe. Provider determines coverage. Missing a stock? Add via custom symbols.")
+    st.caption("Scans available PSX universe. FIX 32: Universe deduplicated for faster scanning.")
+    st.caption("FIX 37: Scanner performance optimized.")
     
     universe_option = st.selectbox(
         "Universe",
