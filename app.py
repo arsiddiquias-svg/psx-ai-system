@@ -533,7 +533,42 @@ def build_indicators(df):
     d["52W_LOW"] = d["Low"].shift(1).rolling(252, min_periods=20).min()
     
     return d
+# ============================================================
+# ESTIMATE PACE TO TARGET
+# ============================================================
 
+def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
+    """
+    Estimate pace to target1 using ATR.
+    
+    Returns: (trade_type, pace_label)
+    """
+    last = result["last"]
+    risk = result["risk"]
+    breakout = result["breakout"]
+    pullback = result["pullback"]
+    
+    # Trade Type
+    if "CONFIRMED BREAKOUT" in breakout["status"] and "EXTENDED" not in breakout["status"]:
+        trade_type = "Day/Short-Term"
+    elif pullback["status"] == "HEALTHY PULLBACK":
+        trade_type = "Swing"
+    else:
+        trade_type = "Momentum"
+    
+    # Estimated Pace
+    atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
+    entry = risk["entry"]
+    target1 = risk["target1"]
+    distance_to_target1 = abs(target1 - entry)
+    
+    if atr_val > 0 and distance_to_target1 > 0:
+        est_sessions = max(1, round(distance_to_target1 / atr_val))
+        pace_label = f"~{est_sessions} sessions (technical estimate)"
+    else:
+        pace_label = "N/A"
+    
+    return trade_type, pace_label
 # ============================================================
 # CROSSOVER DETECTION (FIXED - HANDLES EQUAL VALUES)
 # ============================================================
