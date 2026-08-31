@@ -18,6 +18,7 @@ Key Improvements in v3.0:
 - Prominent stale data warning (FIX 35)
 - Alternative KSE-100 sources (FIX 36)
 - Scanner performance optimization (FIX 37)
+- CORRECT psxdata API calls (FIX 38)
 """
 
 import streamlit as st
@@ -26,7 +27,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import time
 from typing import Optional, Tuple, Dict, Any, List, Union
 import requests
@@ -317,64 +318,87 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
     return True, "Valid"
 
 # ============================================================
-# PROVIDER 1: psxdata
+# PROVIDER 1: psxdata (FIX 38 — CORRECT API)
 # ============================================================
+#
+# LEGAL NOTE: psxdata scrapes dps.psx.com.pk under the hood — same source
+# flagged in FIX 29's legal review. Using it carries the same PSX Terms-of-Use
+# risk as direct scraping. Retained as experimental/personal-use only.
 
 def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
+    """
+    Fetch OHLCV data using psxdata.stocks().
+    
+    FIX 38: Uses verified API — psxdata.stocks(symbol, start=start_date)
+    Returns DataFrame directly, NOT an object with .history() methods.
+    """
     try:
         import psxdata
-        symbol = normalize_ticker_display(ticker)
         
-        df = None
-        for func_name in ["get_historical_data", "historical_data", "history"]:
-            if hasattr(psxdata, func_name):
-                try:
-                    func = getattr(psxdata, func_name)
-                    df = func(symbol, period=period)
-                    if df is not None and not df.empty:
-                        break
-                except Exception:
-                    continue
+        symbol = normalize_ticker_display(ticker)  # e.g. "SYS", no .KA suffix
         
-        if df is None or df.empty:
-            if hasattr(psxdata, "stocks"):
-                try:
-                    stock = psxdata.stocks(symbol)
-                    if hasattr(stock, "history"):
-                        df = stock.history(period=period)
-                    elif hasattr(stock, "historical"):
-                        df = stock.historical(period=period)
-                except Exception:
-                    pass
+        # Map period to days
+        period_days = {
+            "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365,
+            "2y": 730, "5y": 1825
+        }.get(period, 365)
+        
+        start_date = date.today() - timedelta(days=period_days)
+        
+        # FIX 38 — Correct API: psxdata.stocks(symbol, start=start_date)
+        df = psxdata.stocks(symbol, start=start_date)
         
         if df is None or df.empty:
             update_provider_status("psxdata", available=True, error="No data returned")
             return None, "EMPTY", "No data returned from psxdata"
         
+        # Normalize column names to title case (Open, High, Low, Close, Volume)
+        col_map = {}
+        for c in df.columns:
+            c_lower = str(c).lower()
+            if c_lower in ["open", "o"]:
+                col_map[c] = "Open"
+            elif c_lower in ["high", "h"]:
+                col_map[c] = "High"
+            elif c_lower in ["low", "l"]:
+                col_map[c] = "Low"
+            elif c_lower in ["close", "c", "price"]:
+                col_map[c] = "Close"
+            elif c_lower in ["volume", "vol", "v"]:
+                col_map[c] = "Volume"
+            elif "date" in c_lower or "time" in c_lower:
+                col_map[c] = "Date"
+        
+        if col_map:
+            df = df.rename(columns=col_map)
+        
+        # Ensure required columns
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:
             update_provider_status("psxdata", available=True, error=f"Missing columns: {missing}")
             return None, "EXCEPTION", f"Missing columns: {missing}"
         
-        df = df[required].apply(pd.to_numeric, errors="coerce")
+        # Convert to numeric
+        df[required] = df[required].apply(pd.to_numeric, errors="coerce")
         df = df.dropna()
         
         if df.empty:
             update_provider_status("psxdata", available=True, error="Data empty after cleaning")
             return None, "EMPTY", "Data empty after cleaning"
         
+        # Set index to Date if available
+        if "Date" in df.columns:
+            df.index = pd.to_datetime(df["Date"])
+            df = df.drop(columns=["Date"])
+        
+        # Validate
         valid, msg = _validate_ohlcv(df)
         if not valid:
             update_provider_status("psxdata", available=True, error=msg)
             return None, "EXCEPTION", msg
         
-        if not isinstance(df.index, pd.DatetimeIndex):
-            if "date" in df.columns:
-                df.index = pd.to_datetime(df["date"])
-                df = df.drop(columns=["date"])
-        
-        update_provider_status("psxdata", available=True, coverage=len(df), kse100=True)
+        update_provider_status("psxdata", available=True, coverage=len(df))
         return df, "SUCCESS", None
         
     except ImportError:
@@ -384,111 +408,47 @@ def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.Da
         update_provider_status("psxdata", available=True, error=str(e))
         return None, "EXCEPTION", f"psxdata error: {str(e)}"
 
-def fetch_psxdata_kse100() -> Tuple[Optional[pd.DataFrame], str, str]:
-    try:
-        import psxdata
-        
-        df = None
-        if hasattr(psxdata, "indices"):
-            try:
-                df = psxdata.indices("KSE100")
-            except Exception:
-                pass
-        
-        if df is None or df.empty:
-            if hasattr(psxdata, "stocks"):
-                try:
-                    stock = psxdata.stocks("KSE100")
-                    if hasattr(stock, "history"):
-                        df = stock.history(period="1y")
-                    elif hasattr(stock, "historical"):
-                        df = stock.historical(period="1y")
-                except Exception:
-                    pass
-        
-        if df is None or df.empty:
-            return None, "psxdata (no data)", "No KSE-100 data from psxdata"
-        
-        if "Close" not in df.columns:
-            for c in df.columns:
-                if "close" in str(c).lower():
-                    df = df.rename(columns={c: "Close"})
-                    break
-            if "Close" not in df.columns:
-                return None, "psxdata (no close)", "No close column in KSE-100 data"
-        
-        df = df[["Close"]].dropna()
-        if df.empty:
-            return None, "psxdata (empty)", "KSE-100 data empty"
-        
-        if not isinstance(df.index, pd.DatetimeIndex):
-            if "date" in df.columns:
-                df.index = pd.to_datetime(df["date"])
-                df = df.drop(columns=["date"])
-        
-        update_provider_status("psxdata", available=True, kse100=True)
-        return df, "psxdata", None
-        
-    except ImportError:
-        update_provider_status("psxdata", available=False, error="psxdata not installed")
-        return None, "psxdata (not installed)", "psxdata not installed"
-    except Exception as e:
-        update_provider_status("psxdata", available=True, error=str(e))
-        return None, "psxdata (error)", str(e)
-
 # ============================================================
-# FIX 32 + FIX 37 — UNIVERSE DEDUPLICATION & PERFORMANCE
+# FIX 38 — CORRECT psxdata Universe via symbols()
 # ============================================================
 
 def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
+    """
+    Fetch PSX universe using psxdata.symbols().
+    
+    FIX 38: Uses verified API — psxdata.symbols() returns DataFrame with
+    symbol, name, sector_name, is_etf, is_debt, is_gem columns.
+    Filters to common equity only (excludes debt, ETFs, GEM board).
+    """
     try:
         import psxdata
         
-        tickers = None
-        if hasattr(psxdata, "get_all_tickers"):
-            try:
-                tickers = psxdata.get_all_tickers()
-            except Exception:
-                pass
+        # FIX 38 — Correct API: psxdata.symbols()
+        df = psxdata.symbols()
         
-        if tickers is None or len(tickers) == 0:
-            if hasattr(psxdata, "tickers"):
-                try:
-                    tickers = psxdata.tickers()
-                except Exception:
-                    pass
+        if df is None or df.empty:
+            return None, "psxdata (no symbols)", "No symbols data"
         
-        if tickers is None or len(tickers) == 0:
-            if hasattr(psxdata, "stocks"):
-                try:
-                    tickers = psxdata.stocks()
-                except Exception:
-                    pass
+        # Filter to common equity only
+        # Exclude debt, ETFs, GEM board
+        common = df[
+            (df["is_debt"] == False) & 
+            (df["is_etf"] == False) & 
+            (df["is_gem"] == False)
+        ]
         
-        if tickers is None or len(tickers) == 0:
-            return None, "psxdata (no tickers)", "No tickers from psxdata"
+        if common.empty:
+            # Fallback: use all symbols (less filtered)
+            common = df
         
-        # FIX 32 + FIX 37 — Deduplicate and filter only .KA tickers
-        if isinstance(tickers, list):
-            # Keep only .KA tickers
-            ka_tickers = [t for t in tickers if isinstance(t, str) and t.endswith(".KA")]
-            # Deduplicate
-            unique_tickers = list(dict.fromkeys(ka_tickers))
-            if len(unique_tickers) > 0:
-                tickers = unique_tickers
-            else:
-                # Fallback: format all tickers
-                formatted = []
-                for t in tickers:
-                    if isinstance(t, str):
-                        if not t.endswith(".KA"):
-                            formatted.append(t + ".KA")
-                        else:
-                            formatted.append(t)
-                tickers = list(dict.fromkeys(formatted))
+        # Extract symbols and normalize to .KA format
+        ticker_list = [normalize_ticker(s) for s in common["symbol"].tolist() if isinstance(s, str)]
         
-        update_provider_status("psxdata", coverage=len(tickers))
-        return tickers, "psxdata", None
+        # Deduplicate
+        ticker_list = list(dict.fromkeys(ticker_list))
+        
+        update_provider_status("psxdata", coverage=len(ticker_list))
+        return ticker_list, "psxdata (common equity, filtered)", None
         
     except ImportError:
         return None, "psxdata (not installed)", "psxdata not installed"
@@ -584,45 +544,24 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame]
     return None, "EXCEPTION", "No provider could fetch data for this ticker", "UNAVAILABLE"
 
 # ============================================================
-# MASTER fetch_market_index() (FIX 36 — Alternative KSE-100 sources)
+# FIX 38 — REMOVED psxdata KSE-100 attempt (no price series function)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
     """
-    Fetch KSE-100 data. Tries multiple sources:
-    1. psxdata (experimental)
-    2. psx-data-hub (if available)
-    3. yfinance candidates (fallback)
+    Fetch KSE-100 data. Tries:
+    1. psx-data-hub (if available)
+    2. yfinance candidates (fallback)
+    
+    REMOVED: psxdata.indices() attempt — it returns constituent/weight data,
+    NOT a KSE-100 price time-series. psxdata has no KSE-100 OHLCV function.
     
     NEVER blocks the app if any provider fails.
     """
     
     # ============================================================
-    # 1. Try psxdata first
-    # ============================================================
-    try:
-        import psxdata
-        kse_df = psxdata.indices("KSE100")
-        if kse_df is not None and not kse_df.empty:
-            if "Close" not in kse_df.columns:
-                pass
-            else:
-                kse_df = kse_df.dropna(subset=["Close"])
-                if len(kse_df) >= 40:
-                    last_close = float(kse_df["Close"].iloc[-1])
-                    if KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX:
-                        daily_vol = kse_df["Close"].pct_change().std()
-                        if not pd.isna(daily_vol) and daily_vol <= 0.06:
-                            update_provider_status("psxdata", available=True, kse100=True)
-                            return kse_df, "psxdata (KSE100 official - experimental)"
-    except ImportError:
-        pass
-    except Exception:
-        pass
-    
-    # ============================================================
-    # 2. FIX 36 — Try alternative psx-data-hub
+    # 1. Try psx-data-hub (FIX 36)
     # ============================================================
     try:
         import requests
@@ -638,7 +577,6 @@ def fetch_market_index():
                             df = df.rename(columns={"close": "Close"})
                         df = df[["Close"]].dropna()
                         if len(df) > 20:
-                            # Try to parse dates
                             if "date" in df.columns or "Date" in df.columns:
                                 date_col = "date" if "date" in df.columns else "Date"
                                 df.index = pd.to_datetime(df[date_col])
@@ -653,7 +591,7 @@ def fetch_market_index():
         pass
     
     # ============================================================
-    # 3. Fallback: yfinance candidates
+    # 2. Fallback: yfinance candidates
     # ============================================================
     for cand in MARKET_INDEX_CANDIDATES:
         try:
@@ -686,7 +624,7 @@ def fetch_market_index():
     return None, None
 
 # ============================================================
-# MASTER UNIVERSE FETCH (FIX 32 + FIX 37)
+# MASTER UNIVERSE FETCH (FIX 32 + FIX 37 + FIX 38)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1757,13 +1695,13 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
         "has_sma200": not pd.isna(last.get("SMA200", np.nan)),
         "cap_size": cap_size,
         "data_source": source,
-        "avg_volume": avg_volume,  # FIX 31 — Added for screener filter
+        "avg_volume": avg_volume,
     }
     
     return result, "SUCCESS", None, source
 
 # ============================================================
-# SCREENER (FIX 31 — Avg Volume column added for filter)
+# SCREENER
 # ============================================================
 
 def run_screener(universe: List[str], period: str = "6mo", penny_threshold: float = PENNY_STOCK_THRESHOLD, rvol_threshold: float = 2.0):
@@ -1787,7 +1725,7 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
                 "Cap Size": None,
                 "Source": source,
                 "Why": "Data unavailable",
-                "Avg Volume": None,  # FIX 31
+                "Avg Volume": None,
                 "_ticker_raw": ticker,
             })
             continue
@@ -1815,7 +1753,6 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
         
         why_text = " + ".join(why_parts[:4]) if why_parts else "No clear setup"
         
-        # FIX 31 — Add Avg Volume column
         avg_volume = result["avg_volume"] if not pd.isna(result["avg_volume"]) else 0
         
         rows.append({
@@ -1831,7 +1768,7 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
             "Cap Size": result["cap_size"],
             "Source": result["data_source"],
             "Why": why_text,
-            "Avg Volume": round(avg_volume, 0),  # FIX 31
+            "Avg Volume": round(avg_volume, 0),
             "_ticker_raw": ticker,
         })
     
@@ -2286,7 +2223,7 @@ with tab_dash:
                 st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
 
 # ============================================================
-# SCREENER TAB (FIX 32 + FIX 37 — Deduplicated universe)
+# SCREENER TAB
 # ============================================================
 
 with tab_screener:
@@ -2294,6 +2231,7 @@ with tab_screener:
     
     st.caption("Scans available PSX universe. FIX 32: Universe deduplicated for faster scanning.")
     st.caption("FIX 37: Scanner performance optimized.")
+    st.caption("FIX 38: Uses psxdata.symbols() for genuine common-equity universe.")
     
     universe_option = st.selectbox(
         "Universe",
@@ -2391,7 +2329,6 @@ with tab_screener:
         if max_price < 10000:
             view = view[view["Price"] <= max_price]
         
-        # FIX 31 — Min Avg Volume filter now works
         if min_avg_volume > 0:
             view = view[view["Avg Volume"] >= min_avg_volume]
         
@@ -2729,7 +2666,6 @@ with tab_market:
         st.caption("No KSE-100 data from any provider. Market regime confidence reduced.")
         
         with st.expander("🔍 Provider Diagnostics"):
-            # Note: PROVIDER_STATUS reflects only cache-miss calls, not cache hits
             diag_df = pd.DataFrame([
                 {"Provider": k, "Available": v["available"], "Coverage": v["coverage"], "KSE-100": v["kse100"], "Error": v["error"][:100] if v["error"] else None}
                 for k, v in PROVIDER_STATUS.items()
@@ -2750,7 +2686,6 @@ with tab_market:
         
         st.info(f"**Reasoning:** {market['reasoning']}")
         
-        # KSE-100 Chart
         idx_df, _ = fetch_market_index()
         if idx_df is not None and len(idx_df) > 30:
             idx_df["SMA20"] = sma(idx_df["Close"], 20)
@@ -2778,7 +2713,6 @@ with tab_market:
     else:
         st.info("Proxy unavailable — insufficient data")
     
-    # Provider Diagnostics
     with st.expander("🔍 Provider Diagnostics"):
         diag_df = pd.DataFrame([
             {"Provider": k, "Available": "✅" if v["available"] else "❌", "Coverage": v["coverage"], "KSE-100": "✅" if v["kse100"] else "❌", "Last Success": v["last_success"].strftime("%d-%b %H:%M") if v["last_success"] else "Never", "Error": v["error"][:100] if v["error"] else "-"}
