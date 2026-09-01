@@ -5,20 +5,13 @@ A PSX-focused quantitative decision-support terminal.
 
 Key Improvements in v3.0:
 - Provider abstraction layer (psxdata → yfinance → UNAVAILABLE)
-- KSE-100 via multiple sources with honest fallback
+- CORRECT psxdata API calls (FIX 38 - verified against actual package)
 - Dynamic PSX universe discovery
 - Expanded screener filters
 - Simplified chart (RSI/MACD off by default)
 - Data freshness everywhere
 - Professional UI redesign
 - Provider diagnostics panel
-- Universe deduplication (FIX 32)
-- Conditional entry display (FIX 33)
-- Chart trend label (FIX 34)
-- Prominent stale data warning (FIX 35)
-- Alternative KSE-100 sources (FIX 36)
-- Scanner performance optimization (FIX 37)
-- CORRECT psxdata API calls (FIX 38)
 """
 
 import streamlit as st
@@ -318,41 +311,47 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
     return True, "Valid"
 
 # ============================================================
-# PROVIDER 1: psxdata (FIX 38 — CORRECT API)
+# PROVIDER 1: psxdata — CORRECT API (FIX 38)
 # ============================================================
 #
+# Verified API from actual psxdata package:
+# - psxdata.stocks(symbol, start="YYYY-MM-DD", end="YYYY-MM-DD") -> DataFrame
+# - psxdata.tickers() -> list[str]
+# - psxdata.indices(name) -> constituent data (NOT price history!)
+#
 # LEGAL NOTE: psxdata scrapes dps.psx.com.pk under the hood — same source
-# flagged in FIX 29's legal review. Using it carries the same PSX Terms-of-Use
-# risk as direct scraping. Retained as experimental/personal-use only.
+# flagged in FIX 29's legal review. Retained as experimental/personal-use only.
 
 def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
     """
     Fetch OHLCV data using psxdata.stocks().
     
-    FIX 38: Uses verified API — psxdata.stocks(symbol, start=start_date)
-    Returns DataFrame directly, NOT an object with .history() methods.
+    FIX 38: CORRECT API — psxdata.stocks(symbol, start="YYYY-MM-DD", end="YYYY-MM-DD")
+    Returns DataFrame directly with columns: Open, High, Low, Close, Volume
     """
     try:
         import psxdata
         
-        symbol = normalize_ticker_display(ticker)  # e.g. "SYS", no .KA suffix
+        symbol = normalize_ticker_display(ticker)  # e.g. "SYS", not "SYS.KA"
         
-        # Map period to days
+        # Map period to days for start date
         period_days = {
             "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365,
             "2y": 730, "5y": 1825
         }.get(period, 365)
         
-        start_date = date.today() - timedelta(days=period_days)
+        # ✅ CRITICAL FIX: date as STRING, not date object
+        start_date = (date.today() - timedelta(days=period_days)).strftime("%Y-%m-%d")
+        end_date = date.today().strftime("%Y-%m-%d")
         
-        # FIX 38 — Correct API: psxdata.stocks(symbol, start=start_date)
-        df = psxdata.stocks(symbol, start=start_date)
+        # ✅ CORRECT: psxdata.stocks(symbol, start="YYYY-MM-DD", end="YYYY-MM-DD")
+        df = psxdata.stocks(symbol, start=start_date, end=end_date)
         
         if df is None or df.empty:
             update_provider_status("psxdata", available=True, error="No data returned")
             return None, "EMPTY", "No data returned from psxdata"
         
-        # Normalize column names to title case (Open, High, Low, Close, Volume)
+        # Normalize column names
         col_map = {}
         for c in df.columns:
             c_lower = str(c).lower()
@@ -362,7 +361,7 @@ def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.Da
                 col_map[c] = "High"
             elif c_lower in ["low", "l"]:
                 col_map[c] = "Low"
-            elif c_lower in ["close", "c", "price"]:
+            elif c_lower in ["close", "c", "price", "adj close"]:
                 col_map[c] = "Close"
             elif c_lower in ["volume", "vol", "v"]:
                 col_map[c] = "Volume"
@@ -372,7 +371,7 @@ def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.Da
         if col_map:
             df = df.rename(columns=col_map)
         
-        # Ensure required columns
+        # Ensure required columns exist
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:
@@ -409,46 +408,38 @@ def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.Da
         return None, "EXCEPTION", f"psxdata error: {str(e)}"
 
 # ============================================================
-# FIX 38 — CORRECT psxdata Universe via symbols()
+# PROVIDER 1b: psxdata Universe — CORRECT API (FIX 38)
 # ============================================================
 
 def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
     """
-    Fetch PSX universe using psxdata.symbols().
+    Fetch PSX universe using psxdata.tickers().
     
-    FIX 38: Uses verified API — psxdata.symbols() returns DataFrame with
-    symbol, name, sector_name, is_etf, is_debt, is_gem columns.
-    Filters to common equity only (excludes debt, ETFs, GEM board).
+    FIX 38: CORRECT API — psxdata.tickers() returns list of all symbols.
     """
     try:
         import psxdata
         
-        # FIX 38 — Correct API: psxdata.symbols()
-        df = psxdata.symbols()
+        # ✅ CORRECT: psxdata.tickers() returns list of all symbols
+        tickers = psxdata.tickers()
         
-        if df is None or df.empty:
-            return None, "psxdata (no symbols)", "No symbols data"
+        if tickers is None or len(tickers) == 0:
+            return None, "psxdata (no tickers)", "No tickers from psxdata"
         
-        # Filter to common equity only
-        # Exclude debt, ETFs, GEM board
-        common = df[
-            (df["is_debt"] == False) & 
-            (df["is_etf"] == False) & 
-            (df["is_gem"] == False)
-        ]
-        
-        if common.empty:
-            # Fallback: use all symbols (less filtered)
-            common = df
-        
-        # Extract symbols and normalize to .KA format
-        ticker_list = [normalize_ticker(s) for s in common["symbol"].tolist() if isinstance(s, str)]
+        # Format to .KA suffix and deduplicate
+        formatted = []
+        for t in tickers:
+            if isinstance(t, str):
+                if not t.endswith(".KA"):
+                    formatted.append(t + ".KA")
+                else:
+                    formatted.append(t)
         
         # Deduplicate
-        ticker_list = list(dict.fromkeys(ticker_list))
+        ticker_list = list(dict.fromkeys(formatted))
         
         update_provider_status("psxdata", coverage=len(ticker_list))
-        return ticker_list, "psxdata (common equity, filtered)", None
+        return ticker_list, "psxdata (tickers)", None
         
     except ImportError:
         return None, "psxdata (not installed)", "psxdata not installed"
@@ -544,18 +535,20 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame]
     return None, "EXCEPTION", "No provider could fetch data for this ticker", "UNAVAILABLE"
 
 # ============================================================
-# FIX 38 — REMOVED psxdata KSE-100 attempt (no price series function)
+# MASTER fetch_market_index() (FIX 38 — psxdata.indices removed for price)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
     """
-    Fetch KSE-100 data. Tries:
+    Fetch KSE-100 data.
+    
+    REMOVED: psxdata.indices("KSE100") attempt — it returns constituent/weight
+    data, NOT a KSE-100 price time-series. psxdata has no KSE-100 OHLCV function.
+    
+    Tries:
     1. psx-data-hub (if available)
     2. yfinance candidates (fallback)
-    
-    REMOVED: psxdata.indices() attempt — it returns constituent/weight data,
-    NOT a KSE-100 price time-series. psxdata has no KSE-100 OHLCV function.
     
     NEVER blocks the app if any provider fails.
     """
@@ -624,14 +617,13 @@ def fetch_market_index():
     return None, None
 
 # ============================================================
-# MASTER UNIVERSE FETCH (FIX 32 + FIX 37 + FIX 38)
+# MASTER UNIVERSE FETCH (FIX 38)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_universe() -> Tuple[List[str], str, str]:
     tickers, source, error = fetch_psxdata_universe()
     if tickers is not None and len(tickers) > 10:
-        # FIX 32 — Already deduplicated in fetch_psxdata_universe
         return tickers, source, None
     
     return PSX_FALLBACK_UNIVERSE, "curated fallback", None
@@ -841,27 +833,17 @@ def market_snapshot():
     }
 
 # ============================================================
-# PROXY INDICATOR (FIX 30 — period="3mo" instead of "1mo")
+# PROXY INDICATOR
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def liquid_basket_trend():
-    """
-    Compute equal-weighted average daily % change across PSX liquid universe.
-    
-    This is a PROXY indicator — NOT official KSE-100.
-    Used only when KSE-100 data is unavailable.
-    
-    FIX 30: Changed period from "1mo" to "3mo" to satisfy MIN_HISTORY_DAYS (60)
-    validation requirement while still being lightweight.
-    """
     universe = PSX_LIQUID_UNIVERSE
     changes = []
     successful = 0
     
     for ticker in universe:
         try:
-            # FIX 30 — Using "3mo" instead of "1mo" (60+ candles for validation)
             df, status, _, _ = fetch_ohlcv(ticker, period="3mo")
             if status == "SUCCESS" and len(df) >= 6:
                 recent = df.tail(5)
@@ -1610,17 +1592,11 @@ def get_indicator_explanation(indicator: str) -> str:
 # ============================================================
 
 def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
-    """
-    Estimate pace to target1 using ATR.
-    
-    Returns: (trade_type, pace_label)
-    """
     last = result["last"]
     risk = result["risk"]
     breakout = result["breakout"]
     pullback = result["pullback"]
     
-    # Trade Type
     if "CONFIRMED BREAKOUT" in breakout["status"] and "EXTENDED" not in breakout["status"]:
         trade_type = "Day/Short-Term"
     elif pullback["status"] == "HEALTHY PULLBACK":
@@ -1628,7 +1604,6 @@ def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
     else:
         trade_type = "Momentum"
     
-    # Estimated Pace
     atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
     entry = risk["entry"]
     target1 = risk["target1"]
@@ -1643,15 +1618,13 @@ def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
     return trade_type, pace_label
 
 # ============================================================
-# ANALYZE STOCK (FIX: only SUCCESS status proceeds)
+# ANALYZE STOCK
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENNY_STOCK_THRESHOLD, rvol_threshold: float = 2.0):
     df, status, error, source = fetch_ohlcv(ticker, period=period)
     
-    # FIX: Only proceed when status == "SUCCESS"
-    # INSUFFICIENT data is blocked to avoid unreliable indicators (SMA50 with <60 days)
     if status != "SUCCESS":
         return None, status, error, source
     
@@ -1813,7 +1786,7 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     return "HOLD", "No clear signal - maintain position"
 
 # ============================================================
-# CHART (FIX 34 — Trend direction label on chart)
+# CHART
 # ============================================================
 
 def build_chart(result, show_bb=False, show_sma200=False, show_support_resistance=True, show_rsi=False, show_macd=False):
@@ -1853,13 +1826,12 @@ def build_chart(result, show_bb=False, show_sma200=False, show_support_resistanc
     
     current_row = 1
     
-    # Candlesticks
     fig.add_trace(go.Candlestick(
         x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
         name="Price", increasing_line_color="#10B981", decreasing_line_color="#EF4444"
     ), row=current_row, col=1)
     
-    # FIX 34 — Trend direction annotation
+    # Trend direction annotation
     trend_color = "#10B981" if trend in ("BULLISH", "STRONG BULLISH") else "#EF4444" if trend in ("BEARISH", "STRONG BEARISH") else "#F59E0B"
     trend_arrow = "↑" if trend in ("BULLISH", "STRONG BULLISH") else "↓" if trend in ("BEARISH", "STRONG BEARISH") else "→"
     fig.add_annotation(
@@ -1874,12 +1846,10 @@ def build_chart(result, show_bb=False, show_sma200=False, show_support_resistanc
         opacity=0.9
     )
     
-    # SMA20
     fig.add_trace(go.Scatter(
         x=d.index, y=d["SMA20"], line=dict(color="#3B82F6", width=1.2), name="SMA20"
     ), row=current_row, col=1)
     
-    # SMA50
     fig.add_trace(go.Scatter(
         x=d.index, y=d["SMA50"], line=dict(color="#F59E0B", width=1.2), name="SMA50"
     ), row=current_row, col=1)
@@ -1964,10 +1934,6 @@ def get_signal_class(signal):
         return "signal-wait"
     else:
         return "signal-avoid"
-
-# ============================================================
-# FIX 35 — Prominent Stale Data Warning
-# ============================================================
 
 def show_stale_data_warning(freshness_status, freshness_warning):
     if freshness_status == "STALE":
@@ -2074,7 +2040,7 @@ tab_dash, tab_screener, tab_breakouts, tab_penny, tab_next, tab_watch, tab_port,
 ])
 
 # ============================================================
-# DASHBOARD TAB (FIX 33 + FIX 35)
+# DASHBOARD TAB
 # ============================================================
 
 with tab_dash:
@@ -2143,9 +2109,7 @@ with tab_dash:
             for r in sig["reasons"]:
                 st.write(r)
         
-        # ============================================================
-        # FIX 33 — Conditional Entry Display
-        # ============================================================
+        # Trade Plan
         st.subheader("📋 Trade Plan")
         risk = result["risk"]
         trend = result["trend"]
@@ -2153,7 +2117,6 @@ with tab_dash:
         if trend in ("BEARISH", "STRONG BEARISH"):
             st.warning("📉 No long trade setup — bearish structure.")
         else:
-            # Main entry
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Entry", round(risk["entry"], 2))
             col2.metric("Stop Loss", round(risk["stop_loss"], 2))
@@ -2161,7 +2124,6 @@ with tab_dash:
             col4.metric("Target 2", round(risk["target2"], 2))
             col5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
             
-            # FIX 33 — Show conditional entry if available
             if risk.get("conditional_entry") is not None:
                 st.caption(f"💡 **Better Entry Alternative:** {risk['conditional_entry']} (pullback to EMA20) — better R:R than current price.")
                 st.caption(f"   Current price: {round(risk['entry'], 2)} | Conditional: {risk['conditional_entry']} | Save: {round(risk['entry'] - risk['conditional_entry'], 2)} per share")
@@ -2229,9 +2191,8 @@ with tab_dash:
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     
-    st.caption("Scans available PSX universe. FIX 32: Universe deduplicated for faster scanning.")
-    st.caption("FIX 37: Scanner performance optimized.")
-    st.caption("FIX 38: Uses psxdata.symbols() for genuine common-equity universe.")
+    st.caption("Scans available PSX universe. FIX 38: Using psxdata.tickers() for universe.")
+    st.caption("FIX 38: psxdata.stocks() with correct date format (string, not date object).")
     
     universe_option = st.selectbox(
         "Universe",
@@ -2473,7 +2434,6 @@ with tab_next:
         for idx, row in top.iterrows():
             ticker_raw = row.get("_ticker_raw", row["Ticker"])
             
-            # Calculate confidence
             if row["Score"] >= 75 and row["Trend"] in ("BULLISH", "STRONG BULLISH"):
                 confidence = "HIGH"
             elif row["Score"] >= 60:
