@@ -1,15 +1,13 @@
 """
-PSX QUANT ENGINE - v6.0 - PRODUCTION
+PSX QUANT ENGINE - v6.1 - PRODUCTION
 =====================================
 A PSX-focused quantitative decision-support terminal.
 
-FIXES APPLIED v6.0:
-1. psx-mcp as PRIMARY data source (Cloudflare worker - no local setup needed)
-2. yfinance as FALLBACK
-3. KSE-100 from psx-mcp indices
-4. Universe from psx-mcp search
-5. All existing features preserved
-6. Real-time PSX data (5-min delay, same as PSX portal)
+FIXES APPLIED v6.1:
+1. Added provider status debug in sidebar
+2. psx-mcp → yfinance → UNAVAILABLE (with auto-fallback)
+3. If psx-mcp fails, app continues with yfinance
+4. Added debug info to see why psx-mcp is failing
 """
 
 import streamlit as st
@@ -29,7 +27,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v6",
+    page_title="PSX Quant Engine v6.1",
     page_icon="📈",
     layout="wide"
 )
@@ -109,14 +107,25 @@ KSE100_PLAUSIBLE_MIN = 5000
 KSE100_PLAUSIBLE_MAX = 1000000
 
 # ============================================================
-# PSX-MCP CONFIG
+# PSX-MCP CONFIG — MULTIPLE ENDPOINTS TO TRY
 # ============================================================
 
-# psx-mcp Cloudflare worker (live instance, no local setup needed)
-MCP_URL = "https://psx-mcp.moizwasti.workers.dev/mcp"
+MCP_URLS = [
+    "https://psx-mcp.moizwasti.workers.dev/mcp",
+    "https://psx-mcp.moizwasti.workers.dev",
+    "https://psx-mcp.moizwasti.workers.dev/sse",
+]
+
+MCP_TOOLS = [
+    "get_indices",
+    "psx_market_summary",
+    "get_market_summary",
+    "indices",
+    "kse100",
+]
 
 # ============================================================
-# PSX UNIVERSE CONSTANTS (Fallback only)
+# PSX UNIVERSE CONSTANTS (Fallback)
 # ============================================================
 
 PSX_LIQUID_UNIVERSE = [
@@ -214,94 +223,77 @@ def get_freshness_status(data_date):
         return "STALE", trading_gap, f"🔴 {trading_gap} trading day(s) old — STALE"
 
 # ============================================================
-# PROVIDER 1: psx-mcp (PRIMARY — Cloudflare worker)
+# MCP DEBUG FUNCTION — TEST ALL ENDPOINTS
+# ============================================================
+
+def test_mcp_endpoints():
+    """Test all MCP endpoints and tools, return working combination."""
+    for url in MCP_URLS:
+        for tool in MCP_TOOLS:
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": tool, "arguments": {}},
+                    "id": 1
+                }
+                response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "result" in data and data["result"] is not None:
+                        return url, tool, "SUCCESS"
+            except Exception:
+                continue
+    return None, None, "FAILED"
+
+# ============================================================
+# PROVIDER 1: psx-mcp (TRY)
 # ============================================================
 
 def call_mcp_tool(tool_name: str, arguments: dict) -> Optional[dict]:
-    """
-    Call psx-mcp Cloudflare worker.
-    Returns the result content or None on failure.
-    """
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments
-        },
-        "id": 1
-    }
-    
-    try:
-        response = requests.post(
-            MCP_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "result" in data and "content" in data["result"]:
-                return data["result"]["content"]
-        return None
-    except Exception:
-        return None
+    """Try all MCP URLs for a given tool."""
+    for url in MCP_URLS:
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+                "id": 1
+            }
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if "result" in data and "content" in data["result"]:
+                    return data["result"]["content"]
+        except Exception:
+            continue
+    return None
 
 def fetch_mcp_ohlcv(ticker: str, days: int = 365) -> Tuple[Optional[pd.DataFrame], str, str]:
-    """
-    Fetch OHLCV data from psx-mcp using the psx_stock_history tool.
-    """
-    symbol = normalize_ticker_display(ticker)  # e.g. "BERG", not "BERG.KA"
+    symbol = normalize_ticker_display(ticker)
     
-    try:
-        # Try psx_stock_history first
-        result = call_mcp_tool("psx_stock_history", {"symbol": symbol, "days": days})
-        
-        if result is None:
-            # Try ohlcv tool as fallback
-            result = call_mcp_tool("ohlcv", {"symbol": symbol, "days": days})
-        
-        if result is None:
-            # Try get_quote + history combination
-            result = call_mcp_tool("get_quote", {"symbol": symbol})
+    # Try different tools
+    tools_to_try = ["psx_stock_history", "ohlcv", "get_quote", "stock_history"]
+    
+    for tool in tools_to_try:
+        try:
+            result = call_mcp_tool(tool, {"symbol": symbol, "days": days})
             if result is not None:
-                # Just quote data, no history
-                quote_data = parse_mcp_quote(result, symbol)
-                if quote_data is not None:
-                    return quote_data, "SUCCESS", None
-        
-        if result is None:
-            update_provider_status("psx_mcp", available=True, error="No data from MCP")
-            return None, "EMPTY", "No data from psx-mcp"
-        
-        # Parse the result into DataFrame
-        df = parse_mcp_ohlcv(result, symbol)
-        
-        if df is None or df.empty:
-            update_provider_status("psx_mcp", available=True, error="Empty data")
-            return None, "EMPTY", "Empty data from psx-mcp"
-        
-        # Validate
-        valid, msg = _validate_ohlcv(df)
-        if not valid:
-            update_provider_status("psx_mcp", available=True, error=msg)
-            return None, "EXCEPTION", msg
-        
-        update_provider_status("psx_mcp", available=True, coverage=len(df))
-        return df, "SUCCESS", None
-        
-    except Exception as e:
-        update_provider_status("psx_mcp", available=True, error=str(e))
-        return None, "EXCEPTION", f"psx-mcp error: {str(e)}"
+                df = parse_mcp_response(result, symbol)
+                if df is not None and not df.empty:
+                    valid, msg = _validate_ohlcv(df)
+                    if valid:
+                        update_provider_status("psx_mcp", available=True, coverage=len(df))
+                        return df, "SUCCESS", None
+        except Exception:
+            continue
+    
+    update_provider_status("psx_mcp", available=False, error="No data from MCP")
+    return None, "EMPTY", "No data from psx-mcp"
 
-def parse_mcp_ohlcv(content, symbol: str) -> Optional[pd.DataFrame]:
-    """
-    Parse OHLCV data from psx-mcp response.
-    The response format varies by tool, try multiple parsers.
-    """
+def parse_mcp_response(content, symbol: str) -> Optional[pd.DataFrame]:
+    """Parse MCP response into DataFrame."""
     try:
-        # Case 1: Content is a list of text items
         if isinstance(content, list):
             text_data = ""
             for item in content:
@@ -316,97 +308,38 @@ def parse_mcp_ohlcv(content, symbol: str) -> Optional[pd.DataFrame]:
             # Try to parse as JSON
             try:
                 data = json.loads(text_data)
-            except:
-                # Try to parse as CSV/table
-                lines = text_data.strip().split("\n")
-                if len(lines) > 1:
-                    # Check if it's tabular data
-                    headers = lines[0].split("\t")
-                    if len(headers) >= 5:
-                        rows = []
-                        for line in lines[1:]:
-                            vals = line.split("\t")
-                            if len(vals) >= 5:
-                                rows.append(vals)
-                        if rows:
-                            df = pd.DataFrame(rows, columns=headers[:5])
-                            # Try to convert to numeric
-                            for col in ["Open", "High", "Low", "Close", "Volume"]:
-                                if col in df.columns:
-                                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                            df = df.dropna()
-                            if not df.empty:
-                                # Set index to date
-                                if "Date" in df.columns or "date" in df.columns:
-                                    date_col = "Date" if "Date" in df.columns else "date"
-                                    df.index = pd.to_datetime(df[date_col])
-                                    df = df.drop(columns=[date_col])
-                                return df
-            
-            # If JSON, try to extract OHLCV
-            if isinstance(data, dict):
-                # Check for standard OHLCV keys
-                for key in ["data", "history", "ohlcv", "values"]:
-                    if key in data and isinstance(data[key], list):
-                        df = pd.DataFrame(data[key])
+                if isinstance(data, list) and len(data) > 0:
+                    df = pd.DataFrame(data)
+                    return _normalize_ohlcv_df(df)
+                elif isinstance(data, dict):
+                    if "data" in data and isinstance(data["data"], list):
+                        df = pd.DataFrame(data["data"])
                         return _normalize_ohlcv_df(df)
-                
-                # Check if data itself is OHLCV
-                if "Close" in data or "close" in data:
-                    return _normalize_ohlcv_df(pd.DataFrame([data]))
+            except:
+                pass
             
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
-                return _normalize_ohlcv_df(df)
-        
-        # Case 2: Content is a dict with data directly
-        if isinstance(content, dict):
-            return _normalize_ohlcv_df(pd.DataFrame([content]))
-        
-        return None
-        
-    except Exception as e:
-        return None
-
-def parse_mcp_quote(content, symbol: str) -> Optional[pd.DataFrame]:
-    """Parse quote data from psx-mcp response."""
-    try:
-        if isinstance(content, list):
-            text_data = ""
-            for item in content:
-                if isinstance(item, dict) and "text" in item:
-                    text_data += item["text"]
-                elif isinstance(item, str):
-                    text_data += item
-            
-            if not text_data:
-                return None
-            
-            # Try to extract price
-            import re
-            price_match = re.search(r'[Pp]rice[:]?\s*([\d.]+)', text_data)
-            if price_match:
-                price = float(price_match.group(1))
-                now = pkt_now()
-                df = pd.DataFrame({
-                    "Open": [price],
-                    "High": [price],
-                    "Low": [price],
-                    "Close": [price],
-                    "Volume": [0]
-                }, index=[now])
-                return df
+            # Try to parse as table with headers
+            lines = text_data.strip().split("\n")
+            if len(lines) > 1:
+                headers = lines[0].split("\t")
+                if len(headers) >= 5:
+                    rows = []
+                    for line in lines[1:]:
+                        vals = line.split("\t")
+                        if len(vals) >= 5:
+                            rows.append(vals[:5])
+                    if rows:
+                        df = pd.DataFrame(rows, columns=headers[:5])
+                        return _normalize_ohlcv_df(df)
         
         return None
     except Exception:
         return None
 
 def _normalize_ohlcv_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Normalize OHLCV DataFrame columns."""
     if df is None or df.empty:
         return None
     
-    # Rename columns to standard names
     col_map = {}
     for c in df.columns:
         c_lower = str(c).lower()
@@ -420,32 +353,15 @@ def _normalize_ohlcv_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if col_map:
         df = df.rename(columns=col_map)
     
-    # Ensure required columns exist
     required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        # Try to create missing columns from Close
-        if "Close" in df.columns:
-            if "Open" not in df.columns:
-                df["Open"] = df["Close"]
-            if "High" not in df.columns:
-                df["High"] = df["Close"]
-            if "Low" not in df.columns:
-                df["Low"] = df["Close"]
-            if "Volume" not in df.columns:
-                df["Volume"] = 0
-    
-    # Convert to numeric
     for col in required:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     
     df = df.dropna()
-    
     if df.empty:
         return None
     
-    # Set index to Date if available
     if "Date" in df.columns:
         try:
             df.index = pd.to_datetime(df["Date"])
@@ -453,12 +369,10 @@ def _normalize_ohlcv_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         except:
             pass
     
-    # If no datetime index, use row index
     if not isinstance(df.index, pd.DatetimeIndex):
         try:
             df.index = pd.to_datetime(df.index)
         except:
-            # Create dates starting from today going backwards
             now = pkt_now()
             dates = [now - timedelta(days=i) for i in range(len(df)-1, -1, -1)]
             df.index = dates
@@ -466,79 +380,68 @@ def _normalize_ohlcv_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df
 
 def fetch_mcp_kse100() -> Tuple[Optional[pd.DataFrame], str, str]:
-    """Fetch KSE-100 data from psx-mcp."""
-    try:
-        result = call_mcp_tool("get_indices", {})
-        
-        if result is None:
-            return None, "psx-mcp (no data)", "No KSE-100 data"
-        
-        # Parse KSE-100 value from response
-        if isinstance(result, list):
-            text_data = ""
-            for item in result:
-                if isinstance(item, dict) and "text" in item:
-                    text_data += item["text"]
-                elif isinstance(item, str):
-                    text_data += item
-            
-            # Find KSE-100 value
-            import re
-            # Look for KSE100 or KSE-100 followed by a number
-            match = re.search(r'(?:KSE100|KSE-100).*?([\d,]+\.?\d*)', text_data, re.IGNORECASE)
-            if match:
-                value_str = match.group(1).replace(",", "")
-                try:
-                    value = float(value_str)
-                    if KSE100_PLAUSIBLE_MIN <= value <= KSE100_PLAUSIBLE_MAX:
-                        now = pkt_now()
-                        df = pd.DataFrame({"Close": [value]}, index=[now])
-                        update_provider_status("psx_mcp", available=True, kse100=True)
-                        return df, "psx-mcp (KSE-100)", None
-                except:
-                    pass
-        
-        return None, "psx-mcp (not found)", "KSE-100 not found in response"
-        
-    except Exception as e:
-        return None, "psx-mcp (error)", str(e)
+    tools_to_try = ["get_indices", "psx_market_summary", "get_market_summary", "indices"]
+    
+    for tool in tools_to_try:
+        try:
+            result = call_mcp_tool(tool, {})
+            if result is not None:
+                # Parse KSE-100 value
+                if isinstance(result, list):
+                    text_data = ""
+                    for item in result:
+                        if isinstance(item, dict) and "text" in item:
+                            text_data += item["text"]
+                        elif isinstance(item, str):
+                            text_data += item
+                    
+                    import re
+                    match = re.search(r'(?:KSE100|KSE-100).*?([\d,]+\.?\d*)', text_data, re.IGNORECASE)
+                    if match:
+                        value_str = match.group(1).replace(",", "")
+                        try:
+                            value = float(value_str)
+                            if KSE100_PLAUSIBLE_MIN <= value <= KSE100_PLAUSIBLE_MAX:
+                                now = pkt_now()
+                                df = pd.DataFrame({"Close": [value]}, index=[now])
+                                update_provider_status("psx_mcp", available=True, kse100=True)
+                                return df, "psx-mcp (KSE-100)", None
+                        except:
+                            pass
+        except Exception:
+            continue
+    
+    return None, "psx-mcp (no data)", "No KSE-100 data"
 
 def fetch_mcp_universe() -> Tuple[Optional[List[str]], str, str]:
-    """Fetch PSX universe from psx-mcp."""
-    try:
-        result = call_mcp_tool("search_symbols", {})
-        
-        if result is None:
-            return None, "psx-mcp (no data)", "No universe data"
-        
-        # Parse symbols from response
-        if isinstance(result, list):
-            text_data = ""
-            for item in result:
-                if isinstance(item, dict) and "text" in item:
-                    text_data += item["text"]
-                elif isinstance(item, str):
-                    text_data += item
-            
-            # Try to extract symbols (tickers)
-            # Look for pattern: SYS, OGDC, LUCK, etc.
-            import re
-            symbols = re.findall(r'\b([A-Z]{2,6})\b', text_data)
-            if symbols:
-                # Filter out common words that might be symbols
-                common_words = {"KSE", "PSX", "KMI", "MII", "OGTI", "BKTI", "ALLSHR", "PSXDIV20"}
-                symbols = [s for s in symbols if s not in common_words and len(s) >= 2]
-                if symbols:
-                    # Format to .KA suffix
-                    formatted = [s + ".KA" for s in symbols]
-                    ticker_list = list(dict.fromkeys(formatted))
-                    update_provider_status("psx_mcp", available=True, coverage=len(ticker_list))
-                    return ticker_list, "psx-mcp (search)", None
-        
-        return None, "psx-mcp (no symbols)", "No symbols found"
-        
-    except Exception as e:
-        return None, "psx-mcp (error)", str(e)
+    tools_to_try = ["search_symbols", "get_all_symbols", "symbols"]
+    
+    for tool in tools_to_try:
+        try:
+            result = call_mcp_tool(tool, {})
+            if result is not None:
+                if isinstance(result, list):
+                    text_data = ""
+                    for item in result:
+                        if isinstance(item, dict) and "text" in item:
+                            text_data += item["text"]
+                        elif isinstance(item, str):
+                            text_data += item
+                    
+                    import re
+                    symbols = re.findall(r'\b([A-Z]{2,6})\b', text_data)
+                    if symbols:
+                        common_words = {"KSE", "PSX", "KMI", "MII", "OGTI", "BKTI", "ALLSHR", "PSXDIV20"}
+                        symbols = [s for s in symbols if s not in common_words and len(s) >= 2]
+                        if symbols:
+                            formatted = [s + ".KA" for s in symbols]
+                            ticker_list = list(dict.fromkeys(formatted))
+                            update_provider_status("psx_mcp", available=True, coverage=len(ticker_list))
+                            return ticker_list, "psx-mcp", None
+        except Exception:
+            continue
+    
+    return None, "psx-mcp (no symbols)", "No symbols found"
 
 # ============================================================
 # PROVIDER 2: yfinance (FALLBACK)
@@ -675,13 +578,7 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame]
     # Try yfinance fallback
     df, status, error = fetch_yfinance_ohlcv(ticker, period)
     if status == "SUCCESS":
-        # Check freshness
-        if df is not None and not df.empty:
-            last_date = df.index[-1]
-            freshness, _, _ = get_freshness_status(last_date)
-            if freshness == "STALE":
-                return df, "STALE", "Data is stale", "yfinance (stale)"
-        return df, status, error, "yfinance (fallback)"
+        return df, status, error, "yfinance"
     
     return None, "EXCEPTION", "No provider could fetch data", "UNAVAILABLE"
 
@@ -2053,16 +1950,52 @@ def show_stale_data_warning(freshness_status, freshness_warning):
         st.info(f"⚠️ {freshness_warning}")
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR — WITH PROVIDER STATUS
 # ============================================================
 
 st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2DD4BF; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#94A3B8; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v6</div>",
+    "Quantitative Decision Support · v6.1</div>",
     unsafe_allow_html=True
 )
+
+# ============================================================
+# PROVIDER STATUS DISPLAY
+# ============================================================
+
+st.sidebar.subheader("🔌 Provider Status")
+
+# Test MCP endpoints on load
+with st.sidebar.expander("📡 Data Providers", expanded=True):
+    mcp_url, mcp_tool, mcp_status = test_mcp_endpoints()
+    
+    if mcp_status == "SUCCESS":
+        st.success(f"✅ psx-mcp: Working")
+        st.caption(f"  URL: {mcp_url}")
+        st.caption(f"  Tool: {mcp_tool}")
+    else:
+        st.error("❌ psx-mcp: Failed")
+        st.caption("  Falling back to yfinance")
+    
+    # yfinance status
+    try:
+        test_ticker = yf.Ticker("SYS.KA")
+        test_data = test_ticker.history(period="5d")
+        if test_data is not None and not test_data.empty:
+            st.success(f"✅ yfinance: Working")
+            st.caption(f"  Latest: {test_data.index[-1].strftime('%Y-%m-%d')}")
+        else:
+            st.warning("⚠️ yfinance: Partial")
+    except:
+        st.error("❌ yfinance: Failed")
+
+st.sidebar.divider()
+
+# ============================================================
+# SIDEBAR — MAIN
+# ============================================================
 
 st.sidebar.header("📈 Analysis")
 
@@ -2289,7 +2222,7 @@ with tab_dash:
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     
-    st.caption("⚠️ Data: psx-mcp (5-min delay) → yfinance fallback")
+    st.caption("⚠️ Data: psx-mcp → yfinance | First 100 symbols by default")
     
     universe_option = st.selectbox(
         "Universe",
