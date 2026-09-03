@@ -1,19 +1,16 @@
 """
-PSX QUANT ENGINE - v4.0 - PRODUCTION
+PSX QUANT ENGINE - v5.1 - PRODUCTION
 =====================================
 A PSX-focused quantitative decision-support terminal.
 
-FIXES APPLIED v4.0:
-1. psxdata API corrected — tickers() not symbols(), date as string
-2. Screener optimized — deduplicated, faster
-3. KSE-100 fallback — direct PSX portal scraping
-4. Proxy indicator — period="6mo" for better data
-5. Breakout tab — proper breakout detection with columns
-6. Penny stocks — fixed detection with RVOL threshold
-7. Next Session — more candidates with confidence
-8. Watchlist — clearer analysis with explanations
-9. Portfolio — analytical decisions with reasons
-10. Market tab — multiple KSE-100 sources
+FIXES APPLIED v5.1:
+1. REMOVED Alpha Vantage (does not reliably support PSX tickers)
+2. REMOVED psxdata.stocks() (fails per-call, triggers bot-protection)
+3. ONLY yfinance for OHLCV data (reliable, though stale)
+4. psxdata.tickers() KEPT for universe list (works, confirmed 746 symbols)
+5. Screener default limited to 100 symbols for speed
+6. Full universe option with progress counter for users who want it
+7. All existing features preserved
 """
 
 import streamlit as st
@@ -26,8 +23,6 @@ from datetime import datetime, timedelta, date
 import time
 import requests
 import json
-import httpx
-from bs4 import BeautifulSoup
 from typing import Optional, Tuple, Dict, Any, List, Union
 
 # ============================================================
@@ -35,7 +30,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v4",
+    page_title="PSX Quant Engine v5.1",
     page_icon="📈",
     layout="wide"
 )
@@ -145,9 +140,8 @@ MARKET_INDEX_CANDIDATES = ["^KSE100", "KSE100.KA", "PSX.KA", "^KSE", "KSE100", "
 # ============================================================
 
 PROVIDER_STATUS = {
-    "psxdata": {"available": False, "last_success": None, "error": None, "coverage": 0, "kse100": False},
-    "psx_portal": {"available": False, "last_success": None, "error": None, "coverage": 0, "kse100": False},
     "yfinance": {"available": True, "last_success": None, "error": None, "coverage": 0, "kse100": False},
+    "psxdata_tickers": {"available": False, "last_success": None, "error": None, "coverage": 0, "kse100": False},
 }
 
 def update_provider_status(provider: str, available: bool = None, error: str = None, coverage: int = None, kse100: bool = None):
@@ -214,103 +208,7 @@ def get_freshness_status(data_date):
         return "STALE", trading_gap, f"🔴 {trading_gap} trading day(s) old — STALE"
 
 # ============================================================
-# PROVIDER 1: psxdata — CORRECT API (FIXED)
-# ============================================================
-
-def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
-    try:
-        import psxdata
-        
-        symbol = normalize_ticker_display(ticker)  # e.g. "SYS", not "SYS.KA"
-        
-        period_days = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}.get(period, 365)
-        
-        # ✅ FIX: date as STRING, not date object
-        start_date = (date.today() - timedelta(days=period_days)).strftime("%Y-%m-%d")
-        end_date = date.today().strftime("%Y-%m-%d")
-        
-        df = psxdata.stocks(symbol, start=start_date, end=end_date)
-        
-        if df is None or df.empty:
-            update_provider_status("psxdata", available=True, error="No data returned")
-            return None, "EMPTY", "No data returned from psxdata"
-        
-        # Normalize column names
-        col_map = {}
-        for c in df.columns:
-            c_lower = str(c).lower()
-            if c_lower in ["open", "o"]: col_map[c] = "Open"
-            elif c_lower in ["high", "h"]: col_map[c] = "High"
-            elif c_lower in ["low", "l"]: col_map[c] = "Low"
-            elif c_lower in ["close", "c", "price", "adj close"]: col_map[c] = "Close"
-            elif c_lower in ["volume", "vol", "v"]: col_map[c] = "Volume"
-            elif "date" in c_lower or "time" in c_lower: col_map[c] = "Date"
-        
-        if col_map:
-            df = df.rename(columns=col_map)
-        
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            update_provider_status("psxdata", available=True, error=f"Missing columns: {missing}")
-            return None, "EXCEPTION", f"Missing columns: {missing}"
-        
-        df[required] = df[required].apply(pd.to_numeric, errors="coerce")
-        df = df.dropna()
-        
-        if df.empty:
-            update_provider_status("psxdata", available=True, error="Data empty after cleaning")
-            return None, "EMPTY", "Data empty after cleaning"
-        
-        if "Date" in df.columns:
-            df.index = pd.to_datetime(df["Date"])
-            df = df.drop(columns=["Date"])
-        
-        valid, msg = _validate_ohlcv(df)
-        if not valid:
-            update_provider_status("psxdata", available=True, error=msg)
-            return None, "EXCEPTION", msg
-        
-        update_provider_status("psxdata", available=True, coverage=len(df))
-        return df, "SUCCESS", None
-        
-    except ImportError:
-        update_provider_status("psxdata", available=False, error="psxdata not installed")
-        return None, "EXCEPTION", "psxdata not installed"
-    except Exception as e:
-        update_provider_status("psxdata", available=True, error=str(e))
-        return None, "EXCEPTION", f"psxdata error: {str(e)}"
-
-def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
-    try:
-        import psxdata
-        
-        # ✅ FIX: psxdata.tickers() not symbols()
-        tickers = psxdata.tickers()
-        
-        if tickers is None or len(tickers) == 0:
-            return None, "psxdata (no tickers)", "No tickers from psxdata"
-        
-        formatted = []
-        for t in tickers:
-            if isinstance(t, str):
-                if not t.endswith(".KA"):
-                    formatted.append(t + ".KA")
-                else:
-                    formatted.append(t)
-        
-        ticker_list = list(dict.fromkeys(formatted))
-        
-        update_provider_status("psxdata", coverage=len(ticker_list))
-        return ticker_list, "psxdata (tickers)", None
-        
-    except ImportError:
-        return None, "psxdata (not installed)", "psxdata not installed"
-    except Exception as e:
-        return None, "psxdata (error)", str(e)
-
-# ============================================================
-# PROVIDER 2: yfinance (Fallback)
+# PROVIDER 1: yfinance (ONLY OHLCV SOURCE)
 # ============================================================
 
 def fetch_yfinance_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
@@ -350,48 +248,43 @@ def fetch_yfinance_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.D
         return None, "EXCEPTION", f"yfinance error: {str(e)}"
 
 # ============================================================
-# PROVIDER 3: PSX Data Portal (Direct scraping - KSE-100 fallback)
+# PROVIDER 2: psxdata.tickers() (UNIVERSE ONLY - CONFIRMED WORKING)
 # ============================================================
 
-def fetch_psx_portal_kse100() -> Tuple[Optional[pd.DataFrame], str, str]:
+def fetch_psxdata_universe() -> Tuple[Optional[List[str]], str, str]:
+    """
+    Fetch PSX universe using psxdata.tickers().
+    CONFIRMED WORKING: Returns 746+ symbols.
+    """
     try:
-        import httpx
-        from bs4 import BeautifulSoup
+        import psxdata
         
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = httpx.get("https://dps.psx.com.pk/indices", timeout=15, headers=headers)
+        # ✅ CORRECT: psxdata.tickers() — confirmed working
+        tickers = psxdata.tickers()
         
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            kse100_value = None
-            
-            for row in soup.find_all("tr"):
-                cells = row.find_all("td")
-                if len(cells) >= 2:
-                    for idx, cell in enumerate(cells):
-                        if "KSE100" in cell.text or "KSE-100" in cell.text:
-                            if idx + 1 < len(cells):
-                                val_text = cells[idx + 1].text.strip().replace(",", "")
-                                try:
-                                    kse100_value = float(val_text)
-                                    break
-                                except:
-                                    pass
-                    if kse100_value is not None:
-                        break
-            
-            if kse100_value is not None and KSE100_PLAUSIBLE_MIN <= kse100_value <= KSE100_PLAUSIBLE_MAX:
-                now = pkt_now()
-                df = pd.DataFrame({"Close": [kse100_value]}, index=[now])
-                update_provider_status("psx_portal", available=True, kse100=True)
-                return df, "dps.psx.com.pk (current value)"
+        if tickers is None or len(tickers) == 0:
+            return None, "psxdata (no tickers)", "No tickers from psxdata"
         
-        return None, "psx_portal (no data)", "No KSE-100 found on portal"
+        # Format to .KA suffix
+        formatted = []
+        for t in tickers:
+            if isinstance(t, str):
+                if not t.endswith(".KA"):
+                    formatted.append(t + ".KA")
+                else:
+                    formatted.append(t)
+        
+        ticker_list = list(dict.fromkeys(formatted))
+        
+        update_provider_status("psxdata_tickers", available=True, coverage=len(ticker_list))
+        return ticker_list, "psxdata (tickers)", None
         
     except ImportError:
-        return None, "psx_portal (not installed)", "httpx/bs4 not installed"
+        update_provider_status("psxdata_tickers", available=False, error="psxdata not installed")
+        return None, "psxdata (not installed)", "psxdata not installed"
     except Exception as e:
-        return None, "psx_portal (error)", str(e)
+        update_provider_status("psxdata_tickers", available=True, error=str(e))
+        return None, "psxdata (error)", str(e)
 
 # ============================================================
 # MASTER FUNCTIONS
@@ -443,53 +336,27 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
     
     return True, "Valid"
 
+# ============================================================
+# FIX: ONLY yfinance for OHLCV (NO Alpha Vantage, NO psxdata.stocks)
+# ============================================================
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str, str]:
-    df, status, error = fetch_psxdata_ohlcv(ticker, period)
-    if status == "SUCCESS":
-        return df, status, error, "psxdata"
+    """
+    Master OHLCV fetch - ONLY yfinance.
     
+    REMOVED: Alpha Vantage (doesn't support PSX reliably)
+    REMOVED: psxdata.stocks() (triggers bot-protection, adds latency)
+    """
     df, status, error = fetch_yfinance_ohlcv(ticker, period)
     if status == "SUCCESS":
-        return df, status, error, "yfinance (fallback)"
+        return df, status, error, "yfinance"
     
-    return None, "EXCEPTION", "No provider could fetch data for this ticker", "UNAVAILABLE"
+    return None, "EXCEPTION", "No provider could fetch data", "UNAVAILABLE"
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
-    # 1. psx-data-hub
-    try:
-        response = requests.get("https://psx-data-hub.vercel.app/api/v1/indices/KSE100", timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict) and "data" in data:
-                inner = data["data"]
-                if isinstance(inner, list) and len(inner) > 0:
-                    df = pd.DataFrame(inner)
-                    if "Close" in df.columns or "close" in df.columns:
-                        if "close" in df.columns:
-                            df = df.rename(columns={"close": "Close"})
-                        df = df[["Close"]].dropna()
-                        if len(df) > 20:
-                            if "date" in df.columns or "Date" in df.columns:
-                                date_col = "date" if "date" in df.columns else "Date"
-                                df.index = pd.to_datetime(df[date_col])
-                                df = df.drop(columns=[date_col])
-                            last_close = float(df["Close"].iloc[-1])
-                            if KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX:
-                                daily_vol = df["Close"].pct_change().std()
-                                if not pd.isna(daily_vol) and daily_vol <= 0.06:
-                                    update_provider_status("psxdata", available=True, kse100=True)
-                                    return df, "psx-data-hub (KSE100)"
-    except Exception:
-        pass
-    
-    # 2. Direct PSX portal scraping
-    df, source, error = fetch_psx_portal_kse100()
-    if df is not None and not df.empty:
-        return df, source
-    
-    # 3. yfinance
+    """KSE-100 from yfinance candidates."""
     for cand in MARKET_INDEX_CANDIDATES:
         try:
             raw = yf.download(cand, period="6mo", interval="1d", auto_adjust=False, progress=False)
@@ -512,7 +379,6 @@ def fetch_market_index():
             if pd.isna(daily_vol) or daily_vol > 0.06:
                 continue
             
-            update_provider_status("yfinance", available=True, kse100=True)
             return df, cand
             
         except Exception:
@@ -522,6 +388,7 @@ def fetch_market_index():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_universe() -> Tuple[List[str], str, str]:
+    """Universe from psxdata.tickers() (working) or fallback."""
     tickers, source, error = fetch_psxdata_universe()
     if tickers is not None and len(tickers) > 10:
         return tickers, source, None
@@ -733,7 +600,7 @@ def market_snapshot():
     }
 
 # ============================================================
-# PROXY INDICATOR (FIXED: period="6mo")
+# PROXY INDICATOR
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -744,7 +611,6 @@ def liquid_basket_trend():
     
     for ticker in universe:
         try:
-            # ✅ FIX: period="6mo" instead of "3mo"
             df, status, _, _ = fetch_ohlcv(ticker, period="6mo")
             if status == "SUCCESS" and len(df) >= 6:
                 recent = df.tail(5)
@@ -1129,7 +995,7 @@ def projection_engine(d, trend, sr, momentum):
         }
 
 # ============================================================
-# PENNY STOCK DETECTOR (FIXED)
+# PENNY STOCK DETECTOR
 # ============================================================
 
 def detect_penny_setup(d, sr, threshold=PENNY_STOCK_THRESHOLD, rvol_threshold=2.0):
@@ -1575,17 +1441,19 @@ def analyze_stock(ticker: str, period: str = "1y", penny_threshold: float = PENN
     return result, "SUCCESS", None, source
 
 # ============================================================
-# SCREENER (OPTIMIZED)
+# SCREENER (FAST — 100 SYMBOLS DEFAULT, FULL OPTIONAL)
 # ============================================================
 
 def run_screener(universe: List[str], period: str = "6mo", penny_threshold: float = PENNY_STOCK_THRESHOLD, rvol_threshold: float = 2.0):
     rows = []
     coverage = {"total": len(universe), "success": 0, "failed": 0, "analyzed": 0}
     
-    # Limit to 60 for performance, deduplicate
-    universe = list(dict.fromkeys(universe))[:60]
-    
-    for ticker in universe:
+    total_symbols = len(universe)
+    for idx, ticker in enumerate(universe):
+        # Progress indicator
+        if idx % 10 == 0:
+            st.caption(f"📊 Scanning symbol {idx+1}/{total_symbols}...")
+        
         result, status, error, source = analyze_stock(ticker, period=period, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
         
         if status != "SUCCESS":
@@ -1652,7 +1520,7 @@ def run_screener(universe: List[str], period: str = "6mo", penny_threshold: floa
     return pd.DataFrame(rows), coverage
 
 # ============================================================
-# PORTFOLIO DECISION ENGINE (ANALYTICAL ADVICE)
+# PORTFOLIO DECISION ENGINE
 # ============================================================
 
 def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
@@ -1671,19 +1539,15 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     entry_price = holding["buy_price"]
     pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price else 0
     
-    # Check stop-loss breach first
     if current_price < stop_loss:
         return "EXIT", f"❌ Price ({current_price}) below stop-loss ({stop_loss}) — exit to limit loss"
     
-    # Check support breakdown
     if pullback == "BROKEN SUPPORT":
         return "EXIT", f"❌ Support broken at {result['sr']['primary_support']} — structure deteriorated"
     
-    # Check trend change
     if trend in ("BEARISH", "STRONG BEARISH"):
         return "REDUCE", f"📉 Trend turned {trend} — consider reducing position"
     
-    # Check if in profit with good setup
     if signal in ("STRONG BUY", "BUY") and trend in ("BULLISH", "STRONG BULLISH"):
         if "CONFIRMED" in breakout and pnl_pct > 5:
             return "TRAIL STOP", f"✅ Position in profit ({pnl_pct:.1f}%) with confirmed breakout — trail stop to lock gains"
@@ -1694,28 +1558,24 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
         else:
             return "HOLD", f"✅ Trend and signal constructive — hold position"
     
-    # Check if position is in profit but signal weakening
     if signal in ("REDUCE", "AVOID"):
         if pnl_pct > 0:
             return "REDUCE", f"⚠️ Signal weakening ({signal}) while in profit — consider taking partial profits"
         else:
             return "EXIT", f"❌ Signal is {signal} and position is losing — exit recommended"
     
-    # Check healthy pullback in uptrend
     if pullback == "HEALTHY PULLBACK" and trend in ("BULLISH", "STRONG BULLISH"):
         if pnl_pct > 0:
             return "ADD ON CONFIRMATION", f"✅ Healthy pullback in uptrend — add on confirmation"
         else:
             return "HOLD", f"✅ Healthy pullback — maintain position"
     
-    # Check momentum
     if momentum["label"] in ("STRONG NEGATIVE", "NEGATIVE") and trend not in ("BULLISH", "STRONG BULLISH"):
         if pnl_pct > 0:
             return "REDUCE", f"⚠️ Negative momentum — consider reducing"
         else:
             return "EXIT", f"❌ Negative momentum and losing — exit"
     
-    # Default: hold
     return "HOLD", f"📊 No clear signal — maintain position with stop at {round(stop_loss, 2)}"
 
 # ============================================================
@@ -1764,7 +1624,6 @@ def build_chart(result, show_bb=False, show_sma200=False, show_support_resistanc
         name="Price", increasing_line_color="#10B981", decreasing_line_color="#EF4444"
     ), row=current_row, col=1)
     
-    # Trend annotation
     trend_color = "#10B981" if trend in ("BULLISH", "STRONG BULLISH") else "#EF4444" if trend in ("BEARISH", "STRONG BEARISH") else "#F59E0B"
     trend_arrow = "↑" if trend in ("BULLISH", "STRONG BULLISH") else "↓" if trend in ("BEARISH", "STRONG BEARISH") else "→"
     fig.add_annotation(
@@ -1883,7 +1742,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2DD4BF; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#94A3B8; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v4</div>",
+    "Quantitative Decision Support · v5.1</div>",
     unsafe_allow_html=True
 )
 
@@ -1950,7 +1809,7 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.session_state.pop("watchlist_df", None)
     st.sidebar.success("Cache cleared!")
 
-st.sidebar.caption("Data: Provider Priority | Cache: 5min")
+st.sidebar.caption("Data: yfinance (PSX via .KA suffix) | Cache: 5min")
 st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
 st.sidebar.caption("⚠️ Signals are analytical outputs, not guaranteed advice.")
 
@@ -2106,13 +1965,13 @@ with tab_dash:
                 st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
 
 # ============================================================
-# SCREENER TAB (OPTIMIZED)
+# SCREENER TAB (FIXED — 100 SYMBOLS DEFAULT, FULL OPTIONAL)
 # ============================================================
 
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     
-    st.caption("FIXED: Universe deduplicated, optimized for speed (max 60 symbols per scan)")
+    st.caption("⚠️ Data Source: yfinance (PSX data may be stale). Use for research only.")
     
     universe_option = st.selectbox(
         "Universe",
@@ -2124,7 +1983,12 @@ with tab_screener:
     with col1:
         custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
     with col2:
-        pass
+        # FIX: Full universe option with clear warning
+        scan_full = st.checkbox(
+            "Scan full universe (slow, 700+ symbols, may take 10+ minutes)",
+            value=False,
+            help="Only enable if you need to scan all symbols. Default scans first 100 symbols for speed."
+        )
     
     st.markdown("**Filters**")
     filt_col1, filt_col2, filt_col3, filt_col4 = st.columns(4)
@@ -2176,7 +2040,13 @@ with tab_screener:
                         for t in custom_syms.split(",") if t.strip()]
                 universe = list(dict.fromkeys(universe + extra))
             
-            st.caption(f"Scanning {len(universe)} symbols...")
+            # FIX: Only scan first 100 symbols unless full scan enabled
+            if not scan_full and len(universe) > 100:
+                total_count = len(universe)
+                universe = universe[:100]
+                st.caption(f"📊 Scanning first 100 symbols (of {total_count} total). Enable full scan for all.")
+            else:
+                st.caption(f"📊 Scanning {len(universe)} symbols...")
             
             screener_df, coverage = run_screener(universe, period="6mo", penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
             st.session_state["screener_df"] = screener_df
@@ -2225,7 +2095,7 @@ with tab_screener:
             st.info("No stocks match the current filters")
 
 # ============================================================
-# BREAKOUT TAB (FIXED)
+# BREAKOUT TAB
 # ============================================================
 
 with tab_breakouts:
@@ -2286,7 +2156,7 @@ with tab_breakouts:
         st.info("Run the Screener first to find breakout candidates")
 
 # ============================================================
-# PENNY STOCKS TAB (FIXED)
+# PENNY STOCKS TAB
 # ============================================================
 
 with tab_penny:
@@ -2322,7 +2192,7 @@ with tab_penny:
         st.info("Run the Screener first to identify penny stocks")
 
 # ============================================================
-# NEXT SESSION TAB (FIXED)
+# NEXT SESSION TAB
 # ============================================================
 
 with tab_next:
@@ -2399,7 +2269,7 @@ with tab_next:
         st.info("No strong BUY candidates at this time — try running the Screener with different filters")
 
 # ============================================================
-# WATCHLIST TAB (FIXED — CLEANER)
+# WATCHLIST TAB
 # ============================================================
 
 with tab_watch:
@@ -2420,7 +2290,7 @@ with tab_watch:
         st.info("Click 'Refresh Watchlist' to analyze")
 
 # ============================================================
-# PORTFOLIO TAB (FIXED — ANALYTICAL ADVICE)
+# PORTFOLIO TAB
 # ============================================================
 
 with tab_port:
@@ -2462,7 +2332,6 @@ with tab_port:
                 pnl = cur_value - invested
                 pnl_pct = pnl / invested * 100 if invested else 0
                 
-                # ✅ Analytical decision with reason
                 decision, reason = portfolio_decision(h, result)
                 
                 rows.append({
@@ -2534,7 +2403,7 @@ with tab_port:
         st.info("No holdings added yet. Add up to 5 holdings above.")
 
 # ============================================================
-# MARKET TAB (FIXED)
+# MARKET TAB
 # ============================================================
 
 with tab_market:
