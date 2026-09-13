@@ -1952,3 +1952,879 @@ def build_chart(result, show_bb=False, show_sma200=False,
         template="plotly_white",
     )
     return fig
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+
+def get_signal_class(signal):
+    if signal in ("STRONG BUY", "BUY"): return "signal-buy"
+    elif signal == "WAIT": return "signal-wait"
+    else: return "signal-avoid"
+
+
+def show_stale_data_warning(freshness_status, freshness_warning):
+    if freshness_status == "STALE":
+        st.warning(f"🔴 {freshness_warning}")
+        st.caption("⚠️ Data stale hai. Signal confidence kam hai.")
+    elif freshness_status == "DELAYED":
+        st.info(f"⚠️ {freshness_warning}")
+
+
+def get_indicator_explanation(indicator: str) -> str:
+    explanations = {
+        "SMA20": "20 din ka average price. Price iske upar = short-term mein mazboot.",
+        "SMA50": "50 din ka average. Medium-term direction batata hai.",
+        "RSI": "0-100 ka meter. 70+ = zyada khareeda gaya (overbought). 30- = zyada becha gaya (oversold).",
+        "MACD": "Do average ka farq. Positive = momentum upar, negative = neeche.",
+        "ADX": "Trend ki strength. 25+ = strong trend (chahe upar ya neeche).",
+        "RVOL": "Aaj ka volume normal se kitna zyada. 2x = double activity.",
+        "Support": "Woh price jahan se pehle buyers aaye the — price wahin rukta hai.",
+        "Resistance": "Woh price jahan se pehle sellers aaye the — price wahin rukta hai.",
+        "Breakout": "Jab price resistance ke upar jaata hai, zyada volume ke saath.",
+        "Stop Loss": "Yahan exit karo taake loss control mein rahe.",
+        "Target": "Technical price jahan tak ja sakta hai agar trend chalta rahe.",
+        "ATR": "Rozana ka average movement. Stop-loss set karne mein help karta hai.",
+    }
+    return explanations.get(indicator, "Technical indicator.")
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.markdown(
+    "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
+    "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
+    "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
+    "Quantitative Decision Support · v8.0</div>",
+    unsafe_allow_html=True
+)
+
+st.sidebar.subheader("🔌 Provider Status")
+
+psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
+if psx_avail:
+    kse100_ok = "✅ verified" if PROVIDER_STATUS["psx_official"].get("kse100") else "⚠️ unverified"
+    st.sidebar.success(f"✅ PSX Official: Working ({kse100_ok})")
+else:
+    st.sidebar.warning("⚠️ PSX Official: Not available")
+
+yf_avail = PROVIDER_STATUS.get("yfinance", {}).get("available", True)
+if yf_avail:
+    st.sidebar.success("✅ yfinance: Working (fallback)")
+else:
+    st.sidebar.error("❌ yfinance: Failed")
+
+psxd_avail = PROVIDER_STATUS.get("psxdata", {}).get("available", False)
+if psxd_avail:
+    st.sidebar.info("ℹ️ psxdata: Working (experimental)")
+else:
+    st.sidebar.caption("psxdata: Not installed (optional)")
+
+st.sidebar.divider()
+
+st.sidebar.header("📈 Analysis")
+
+sidebar_ticker = st.sidebar.text_input(
+    "Ticker", value="SYS",
+    help="PSX symbol (SYS, OGDC, LUCK, etc.)"
+)
+
+period = st.sidebar.selectbox(
+    "Analysis Period",
+    ["3mo", "6mo", "1y", "2y", "5y"],
+    index=2
+)
+
+penny_threshold = st.sidebar.number_input(
+    "Penny Stock Threshold (PKR)",
+    min_value=10, max_value=200, value=50, step=5,
+    help="Is price se neeche wale penny stocks hain"
+)
+
+rvol_threshold = st.sidebar.slider(
+    "Penny RVOL Threshold (x avg)",
+    min_value=1.0, max_value=5.0, value=2.0, step=0.5,
+    help="Penny stock pe unusual volume threshold"
+)
+
+st.sidebar.divider()
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    fetch_ohlcv.clear()
+    fetch_market_index.clear()
+    market_snapshot.clear()
+    analyze_stock.clear()
+    fetch_psx_official_index_json.clear()
+    fetch_psx_official_market_watch.clear()
+    st.session_state.pop("screener_df", None)
+    st.session_state.pop("watchlist_df", None)
+    st.session_state.pop("next_session_df", None)
+    st.sidebar.success("Cache cleared!")
+
+st.sidebar.caption("Data: PSX Official → yfinance | Cache: 5min")
+st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
+
+# Session state init
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = []
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = "SYS, OGDC, HBL, LUCK, FFC, ENGRO"
+
+
+# ============================================================
+# MAIN TABS
+# ============================================================
+
+tab_dash, tab_screener, tab_breakouts, tab_next, tab_watch, tab_port, tab_market, tab_top = st.tabs([
+    "📊 Dashboard",
+    "🔍 Screener",
+    "🚀 Breakouts",
+    "📅 Next Session",
+    "📋 Watchlist",
+    "💼 Portfolio",
+    "📈 Market",
+    "🎯 Top Picks"
+])
+
+
+# ============================================================
+# DASHBOARD TAB
+# ============================================================
+
+with tab_dash:
+    result, status, error, source = analyze_stock(
+        sidebar_ticker, period=period,
+        penny_threshold=penny_threshold,
+        rvol_threshold=rvol_threshold
+    )
+
+    if status != "SUCCESS":
+        st.error(f"❌ {sidebar_ticker} analyze nahi ho saka: {error}")
+        with st.expander("🔍 Troubleshooting"):
+            st.write(f"**Status:** {status}")
+            st.write(f"**Error:** {error}")
+            st.write(f"**Source:** {source if source else 'N/A'}")
+            st.write("**Try:** Refresh data ya ticker spelling check karo")
+    else:
+        last = result["last"]
+        sig = result["signal"]
+
+        freshness_status, _, freshness_warning = get_freshness_status(result["data_date"])
+        show_stale_data_warning(freshness_status, freshness_warning)
+
+        recon = result.get("reconciliation", {})
+        if recon.get("mismatch"):
+            st.warning(
+                f"⚠️ Price mismatch — PSX: {recon['psx_price']} | "
+                f"yfinance: {recon['yf_price']} | farq {recon['diff_pct']}% "
+                f"(PSX official use ho raha hai)"
+            )
+
+        col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.2, 1.2, 1.2])
+
+        with col1:
+            st.markdown(f"<span class='current-price'>{round(last['Close'], 2)}</span>",
+                        unsafe_allow_html=True)
+            prev_close = result["df"]["Close"].iloc[-2] if len(result["df"]) >= 2 else last["Close"]
+            change = last["Close"] - prev_close
+            change_pct = (change / prev_close * 100) if prev_close else 0
+            cc = "change-positive" if change >= 0 else "change-negative"
+            st.markdown(
+                f"<span class='{cc}'>{'▲' if change >= 0 else '▼'} "
+                f"{round(change, 2)} ({round(change_pct, 2)}%)</span>",
+                unsafe_allow_html=True
+            )
+            st.caption(f"{result['ticker_display']} · {result['cap_size']}")
+            st.caption(f"Data: {source} · {freshness_status} · {result['data_date'].date()}")
+
+        with col2:
+            sc = get_signal_class(sig["signal"])
+            st.markdown("**Signal**")
+            st.markdown(f"<span class='{sc}'>{sig['signal']}</span>", unsafe_allow_html=True)
+
+        with col3:
+            st.metric("Score", f"{sig['score']}/100")
+        with col4:
+            st.metric("Trend", result["trend"])
+        with col5:
+            st.metric("Setup", sig["setup_quality"])
+
+        mkt = result["market"]
+        if mkt["regime"] != "UNAVAILABLE":
+            st.caption(f"📊 KSE-100: {mkt['regime']} | Level: {round(mkt['last_close'], 0) if mkt['last_close'] else 'N/A'}")
+            st.caption(f"Source: {mkt['source']}")
+        else:
+            st.caption("📊 KSE-100: DATA UNAVAILABLE")
+            proxy = liquid_basket_trend()
+            if proxy["change_pct"] is not None:
+                st.caption(f"📊 Proxy (NOT KSE-100): {proxy['trend']} ({proxy['change_pct']}%)")
+
+        with st.expander("🔍 Why this signal?", expanded=True):
+            for r in sig["reasons"]:
+                st.write(r)
+
+        st.subheader("📋 Trade Plan")
+        risk = result["risk"]
+        trend = result["trend"]
+
+        if risk.get("error"):
+            st.warning(f"⚠️ Risk calculation error: {risk['error']}")
+        elif trend in ("BEARISH", "STRONG BEARISH"):
+            st.warning("📉 Bearish structure — no long setup.")
+        else:
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Entry", round(risk["entry"], 2))
+            c2.metric("Stop Loss", round(risk["stop_loss"], 2))
+            c3.metric("Target 1", round(risk["target1"], 2))
+            c4.metric("Target 2", round(risk["target2"], 2))
+            c5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
+
+            if risk.get("conditional_entry") is not None:
+                st.caption(f"💡 Better Entry: {risk['conditional_entry']} (pullback to EMA20) — {risk['conditional_entry_note']}")
+
+        proj = result["projection"]
+        if proj["direction"] != "NEUTRAL":
+            st.info(f"📈 **Technical Projection:** {proj['label']}")
+            st.caption(proj["note"])
+
+        if result["penny"]["is_penny"]:
+            st.warning(f"🪙 {result['penny']['status']} - {result['penny']['note']}")
+
+        st.subheader("📊 Chart")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        show_bb = c1.checkbox("Bollinger Bands", value=False)
+        show_sma200 = c2.checkbox("SMA200", value=False)
+        show_sr = c3.checkbox("Support/Resistance", value=True)
+        show_rsi = c4.checkbox("RSI", value=False)
+        show_macd = c5.checkbox("MACD", value=False)
+
+        st.plotly_chart(
+            build_chart(result, show_bb, show_sma200, show_sr, show_rsi, show_macd),
+            use_container_width=True
+        )
+        st.caption(
+            "📉 **Projection line** = technical estimate based on ATR targets. "
+            "Market forecast NAHI — sirf current structure ka visual hint."
+        )
+
+        with st.expander("📖 Indicator Explanations"):
+            st.markdown(f"**SMA20:** {get_indicator_explanation('SMA20')} (Current: {round(last['SMA20'],2)})")
+            st.markdown(f"**SMA50:** {get_indicator_explanation('SMA50')} (Current: {round(last['SMA50'],2)})")
+            st.markdown(f"**RSI:** {get_indicator_explanation('RSI')} (Current: {round(last['RSI14'],1)})")
+            st.markdown(f"**MACD:** {get_indicator_explanation('MACD')} (Current: {round(last['MACD_HIST'],2)})")
+            st.markdown(f"**ADX:** {get_indicator_explanation('ADX')} (Current: {round(last['ADX14'],1)})")
+            rvol_val = round(last['VOL_RATIO'],2) if not pd.isna(last['VOL_RATIO']) else 'N/A'
+            st.markdown(f"**RVOL:** {get_indicator_explanation('RVOL')} (Current: {rvol_val}x)")
+            st.markdown(f"**Support:** {get_indicator_explanation('Support')} ({round(result['sr']['primary_support'],2)})")
+            st.markdown(f"**Resistance:** {get_indicator_explanation('Resistance')} ({round(result['sr']['primary_resistance'],2)})")
+            st.markdown(f"**Breakout:** {result['breakout']['status']} — {result['breakout']['note']}")
+            st.markdown(f"**Stop Loss:** {get_indicator_explanation('Stop Loss')} ({round(risk['stop_loss'],2) if risk['stop_loss'] else 'N/A'})")
+            st.markdown(f"**Target:** {get_indicator_explanation('Target')} ({round(risk['target1'],2) if risk['target1'] else 'N/A'})")
+            st.markdown(f"**ATR:** {get_indicator_explanation('ATR')} (Current: {round(last['ATR14'],2)})")
+
+        with st.expander("📊 Support / Resistance Details"):
+            sr = result["sr"]
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("Primary Support", round(sr["primary_support"], 2))
+            cc2.metric("Primary Resistance", round(sr["primary_resistance"], 2))
+            cc3.metric("Secondary Support", round(sr["secondary_support"], 2))
+            cc4.metric("Secondary Resistance", round(sr["secondary_resistance"], 2))
+
+            if not sr.get("secondary_support_is_distinct", True):
+                st.caption("⚠️ Secondary Support = Primary Support")
+            if not sr.get("secondary_resistance_is_distinct", True):
+                st.caption("⚠️ Secondary Resistance = Primary Resistance")
+
+            if not pd.isna(sr["high_52w"]):
+                st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
+            else:
+                st.caption("N/A — insufficient 52-week history")
+
+
+# ============================================================
+# SCREENER TAB
+# ============================================================
+
+with tab_screener:
+    st.subheader("🔍 PSX Opportunity Scanner")
+    st.caption("Data: PSX Official → yfinance | Default: first 100 symbols (speed)")
+
+    universe_option = st.selectbox(
+        "Universe",
+        ["Dynamic (from provider)", "Liquid PSX (~34)", "Small Cap (~25)", "Custom (from watchlist)"],
+        index=0,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
+    with col2:
+        scan_full = st.checkbox(
+            "Scan full universe (slow, 10+ min)",
+            value=False,
+            help="Default scans first 100 symbols"
+        )
+
+    st.markdown("**Filters**")
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        signal_filter = st.multiselect(
+            "Signal",
+            ["STRONG BUY", "BUY", "WAIT", "REDUCE", "AVOID"],
+            default=["STRONG BUY", "BUY"]
+        )
+    with p2:
+        price_range = st.slider(
+            "Price Range (PKR)",
+            min_value=0.0, max_value=5000.0,
+            value=(0.0, 5000.0), step=10.0
+        )
+    with p3:
+        min_score = st.slider("Min Score", 0, 100, 0)
+
+    include_penny = st.checkbox(
+        f"Include penny stocks (below PKR {int(penny_threshold)})",
+        value=False,
+        help="Penny stocks mein high volatility + false breakout risk hota hai"
+    )
+    if include_penny:
+        st.caption("⚠️ Penny stocks: high volatility, liquidity risk, false breakouts")
+
+    with st.expander("⚙️ Advanced Filters"):
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            category_filter = st.multiselect(
+                "Category",
+                ["LARGE-LIKE (proxy)", "MID-LIKE (proxy)", "SMALL-LIKE (proxy)",
+                 "LOW-PRICE (proxy)", "MICRO (proxy)"],
+                default=[]
+            )
+        with a2:
+            breakout_filter = st.multiselect(
+                "Breakout Status",
+                ["CONFIRMED BREAKOUT", "EXTENDED BREAKOUT",
+                 "BREAKOUT READY", "BREAKOUT ATTEMPT"],
+                default=[]
+            )
+        with a3:
+            min_rr = st.slider("Min R:R", 0.0, 5.0, 0.0, 0.1)
+        with a4:
+            min_avg_volume = st.number_input("Min Avg Volume", min_value=0, value=0, step=1000)
+
+    if st.button("🔍 Run Screener", use_container_width=True):
+        with st.spinner("Scanning PSX universe..."):
+            if universe_option == "Dynamic (from provider)":
+                universe, _, _ = fetch_universe()
+            elif universe_option == "Liquid PSX (~34)":
+                universe = PSX_LIQUID_UNIVERSE
+            elif universe_option == "Small Cap (~25)":
+                universe = PSX_SMALL_CAP_UNIVERSE
+            else:
+                universe = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip()
+                           for t in st.session_state.watchlist.split(",") if t.strip()]
+
+            if custom_syms:
+                extra = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip()
+                        for t in custom_syms.split(",") if t.strip()]
+                universe = list(dict.fromkeys(universe + extra))
+
+            if not scan_full and len(universe) > 100:
+                total_count = len(universe)
+                universe = universe[:100]
+                st.caption(f"📊 First 100 symbols (of {total_count}). Enable full scan for all.")
+            else:
+                st.caption(f"📊 Scanning {len(universe)} symbols...")
+
+            screener_df, coverage = run_screener(
+                universe, period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+            st.session_state["screener_df"] = screener_df
+            st.session_state["screener_coverage"] = coverage
+
+    if "screener_coverage" in st.session_state:
+        cov = st.session_state["screener_coverage"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total", cov["total"])
+        c2.metric("Analyzed", cov["analyzed"])
+        c3.metric("Success", cov["success"])
+        c4.metric("Failed", cov["failed"])
+
+    if "screener_df" in st.session_state:
+        df_s = st.session_state["screener_df"]
+        view = df_s.copy()
+
+        if signal_filter:
+            view = view[view["Signal"].isin(signal_filter)]
+        if min_score > 0:
+            view = view[view["Score"].fillna(0) >= min_score]
+        view = view[
+            (view["Price"].fillna(0) >= price_range[0]) &
+            (view["Price"].fillna(0) <= price_range[1])
+        ]
+
+        if not include_penny:
+            penny_mask = view["Penny"].notna() & (view["Penny"] != "N/A")
+            view = view[~penny_mask]
+
+        if category_filter:
+            view = view[view["Cap Size"].isin(category_filter)]
+        if breakout_filter:
+            view = view[view["Status"].astype(str).apply(
+                lambda s: any(bf in s for bf in breakout_filter)
+            )]
+        if min_rr > 0:
+            view = view[view["RR"].fillna(0) >= min_rr]
+        if min_avg_volume > 0:
+            view = view[view["Avg Volume"].fillna(0) >= min_avg_volume]
+
+        view = view[view["Signal"] != "ERROR"]
+
+        sort_by = st.selectbox("Sort by", ["Score", "Change %", "Price"], index=0)
+        view = view.sort_values(sort_by, ascending=False, na_position="last")
+
+        total_scanned = len(df_s)
+        penny_count = len(view[view["Penny"].notna() & (view["Penny"] != "N/A")])
+        st.caption(
+            f"📊 Showing **{len(view)}** of {total_scanned} scanned"
+            + (f" ({penny_count} penny stocks)" if include_penny and penny_count > 0 else "")
+        )
+
+        if not view.empty:
+            display_cols = [c for c in view.columns if not c.startswith("_")]
+            st.dataframe(view[display_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("No stocks match filters")
+
+
+# ============================================================
+# BREAKOUTS TAB
+# ============================================================
+
+with tab_breakouts:
+    st.subheader("🚀 Breakout Candidates")
+
+    if "screener_df" not in st.session_state:
+        st.info("Pehle Screener tab pe 'Run Screener' chalao.")
+    else:
+        df_s = st.session_state["screener_df"]
+        keywords = ["CONFIRMED", "READY", "ATTEMPT", "BREAKOUT"]
+        bo = df_s[df_s["Status"].astype(str).str.contains('|'.join(keywords), case=False, na=False)]
+
+        if bo.empty:
+            st.info("Koi breakout candidate nahi mila.")
+        else:
+            breakout_rows = []
+            for _, row in bo.iterrows():
+                ticker_raw = row.get("_ticker_raw", row["Ticker"])
+                result, status, _, _ = analyze_stock(
+                    ticker_raw, period="1y",
+                    penny_threshold=penny_threshold,
+                    rvol_threshold=rvol_threshold
+                )
+                if status == "SUCCESS":
+                    breakout_rows.append({
+                        "Ticker": row["Ticker"],
+                        "Price": row["Price"],
+                        "Change %": row["Change %"],
+                        "Trend": row["Trend"],
+                        "Score": row["Score"],
+                        "Signal": row["Signal"],
+                        "Status": row["Status"],
+                        "Resistance": round(result["breakout"]["resistance"], 2),
+                        "Dist %": round(result["breakout"]["distance_to_resistance"], 2)
+                                    if result["breakout"]["distance_to_resistance"] is not None else "N/A",
+                        "Momentum": result["momentum"]["label"],
+                        "RR": row["RR"],
+                        "52W": "🚀 BREAKOUT" if result["breakout"]["is_52w_high_breakout"]
+                               else "🔵 NEAR" if result["breakout"]["is_near_52w_high"] else "-",
+                        "Why": row["Why"],
+                    })
+
+            if breakout_rows:
+                bo_df = pd.DataFrame(breakout_rows)
+                bo_df = bo_df.sort_values("Score", ascending=False)
+                st.dataframe(bo_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Koi detailed breakout data available nahi.")
+
+
+# ============================================================
+# NEXT SESSION TAB
+# ============================================================
+
+with tab_next:
+    st.subheader("📅 Next Session Watchlist")
+    st.caption("Next session ke top candidates")
+
+    if st.button("🔄 Refresh Next Session", use_container_width=True):
+        with st.spinner("Scanning..."):
+            combined = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_UNIVERSE))
+            st.session_state["next_session_df"], _ = run_screener(
+                combined, period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+
+    if "next_session_df" not in st.session_state:
+        with st.spinner("Initial scan..."):
+            combined = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_UNIVERSE))
+            st.session_state["next_session_df"], _ = run_screener(
+                combined, period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+
+    df_s = st.session_state["next_session_df"]
+    top = df_s[df_s["Signal"].isin(["STRONG BUY", "BUY"])].dropna(subset=["Score"])
+    top = top.sort_values("Score", ascending=False).head(10)
+
+    if top.empty:
+        st.info("Koi strong BUY candidate nahi mila.")
+    else:
+        rows = []
+        for _, row in top.iterrows():
+            ticker_raw = row.get("_ticker_raw", row["Ticker"])
+
+            if row["Score"] >= 75 and row["Trend"] in ("BULLISH", "STRONG BULLISH"):
+                sq = "HIGH"
+            elif row["Score"] >= 60:
+                sq = "MEDIUM"
+            else:
+                sq = "LOW"
+
+            result, status, _, _ = analyze_stock(
+                ticker_raw, period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+            if status == "SUCCESS":
+                trade_type, pace = estimate_pace_to_target(result)
+                fresh, _, _ = get_freshness_status(result["data_date"])
+            else:
+                trade_type, pace, fresh = "N/A", "N/A", "UNAVAILABLE"
+
+            rows.append({
+                "Ticker": row["Ticker"],
+                "Price": row["Price"],
+                "Trend": row["Trend"],
+                "Score": row["Score"],
+                "Signal": row["Signal"],
+                "Status": row["Status"],
+                "RR": row["RR"],
+                "Trade Type": trade_type,
+                "Est. Pace": pace,
+                "Setup Quality": sq,
+                "Data": fresh,
+                "Why": row["Why"],
+            })
+
+        cap_df = pd.DataFrame(rows)
+        st.dataframe(cap_df, use_container_width=True, hide_index=True)
+        st.caption("⚠️ 'Est. Pace' ATR-based rough estimate hai. Guaranteed timeline nahi.")
+        st.caption("⚠️ 'Setup Quality' score + trend alignment pe based. Statistically calibrated confidence NAHI.")
+
+
+# ============================================================
+# WATCHLIST TAB
+# ============================================================
+
+with tab_watch:
+    st.subheader("📋 Watchlist")
+
+    st.markdown("**Edit Watchlist**")
+    new_watchlist = st.text_area(
+        "Tickers (comma-separated)",
+        value=st.session_state.watchlist,
+        key="watchlist_editor",
+        help="Jaise: SYS, OGDC, HBL, LUCK"
+    )
+
+    wl1, wl2 = st.columns([1, 3])
+    with wl1:
+        if st.button("💾 Save & Update", use_container_width=True):
+            st.session_state.watchlist = new_watchlist
+            st.success("Watchlist saved!")
+    with wl2:
+        st.caption(f"Current: {st.session_state.watchlist}")
+
+    st.divider()
+
+    tickers = [t.strip() for t in st.session_state.watchlist.split(",") if t.strip()]
+
+    if st.button("🔄 Refresh Analysis", use_container_width=True):
+        with st.spinner("Analyzing watchlist..."):
+            watchlist_df, _ = run_screener(
+                tickers, period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+            st.session_state["watchlist_df"] = watchlist_df
+
+    if "watchlist_df" in st.session_state:
+        df_w = st.session_state["watchlist_df"]
+        if not df_w.empty:
+            cols = ["Ticker", "Price", "Change %", "Trend", "Score",
+                    "Signal", "Status", "RR", "Cap Size", "Source", "Why"]
+            cols = [c for c in cols if c in df_w.columns]
+            st.dataframe(df_w[cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Watchlist empty ya koi data nahi mila")
+    else:
+        st.info("Click 'Refresh Analysis' to analyze")
+
+
+# ============================================================
+# PORTFOLIO TAB
+# ============================================================
+
+with tab_port:
+    st.subheader("💼 Portfolio Tracker (max 5)")
+    st.caption("Active Stop = max(Original Stop, Technical Stop) for long positions")
+    st.caption("⚠️ Agar stop-loss data unavailable ho, decision 'WATCH' hoga (crash nahi)")
+
+    with st.form("add_holding"):
+        c1, c2, c3, c4 = st.columns(4)
+        h_ticker = c1.text_input("Ticker")
+        h_price = c2.number_input("Buy Price (PKR)", min_value=0.0, step=0.5)
+        h_shares = c3.number_input("Shares", min_value=0, step=1)
+        h_stop = c4.number_input("Original Stop (PKR)", min_value=0.0, step=0.5,
+                                 help="Aap ka original stop-loss level")
+        submitted = st.form_submit_button("Add Holding")
+        if submitted and h_ticker and h_price > 0 and h_shares > 0:
+            if len(st.session_state.portfolio) >= 5:
+                st.warning("Maximum 5 holdings")
+            else:
+                st.session_state.portfolio.append({
+                    "ticker": h_ticker.strip().upper(),
+                    "buy_price": h_price,
+                    "shares": h_shares,
+                    "original_stop_loss": h_stop if h_stop > 0 else None,
+                })
+                st.success(f"Added {h_ticker}")
+
+    if st.session_state.portfolio:
+        rows = []
+        total_invested = 0
+        total_current = 0
+
+        for h in st.session_state.portfolio:
+            result, status, error, _ = analyze_stock(
+                h["ticker"], period="1y",
+                penny_threshold=penny_threshold,
+                rvol_threshold=rvol_threshold
+            )
+            invested = h["buy_price"] * h["shares"]
+            total_invested += invested
+
+            if status == "SUCCESS":
+                cur_price = result["last"]["Close"]
+                cur_value = cur_price * h["shares"]
+                total_current += cur_value
+                pnl = cur_value - invested
+                pnl_pct = pnl / invested * 100 if invested else 0
+                decision, reason = portfolio_decision(h, result)
+
+                technical_stop = result["risk"]["stop_loss"]
+                original_stop = h.get("original_stop_loss")
+                if original_stop is not None and technical_stop is not None:
+                    active_stop = max(original_stop, technical_stop)
+                elif original_stop is not None:
+                    active_stop = original_stop
+                elif technical_stop is not None:
+                    active_stop = technical_stop
+                else:
+                    active_stop = None
+
+                rows.append({
+                    "Ticker": result["ticker_display"],
+                    "Buy": h["buy_price"],
+                    "Shares": h["shares"],
+                    "Invested": round(invested, 2),
+                    "Current": round(cur_price, 2),
+                    "Value": round(cur_value, 2),
+                    "P/L": round(pnl, 2),
+                    "P/L %": round(pnl_pct, 2),
+                    "Trend": result["trend"],
+                    "Signal": result["signal"]["signal"],
+                    "Original Stop": round(original_stop, 2) if original_stop else "N/A",
+                    "Technical Stop": round(technical_stop, 2) if technical_stop else "N/A",
+                    "Active Stop": round(active_stop, 2) if active_stop else "N/A",
+                    "Target 1": round(result["risk"]["target1"], 2) if result["risk"]["target1"] else "N/A",
+                    "Decision": decision,
+                    "Reason": reason,
+                })
+            else:
+                rows.append({
+                    "Ticker": h["ticker"], "Buy": h["buy_price"], "Shares": h["shares"],
+                    "Invested": round(invested, 2),
+                    "Current": "N/A", "Value": "N/A", "P/L": "N/A", "P/L %": "N/A",
+                    "Trend": None, "Signal": "ERROR",
+                    "Original Stop": h.get("original_stop_loss", "N/A"),
+                    "Technical Stop": None, "Active Stop": None, "Target 1": None,
+                    "Decision": "WATCH", "Reason": error,
+                })
+
+        if total_invested > 0:
+            total_pnl = total_current - total_invested
+            total_pnl_pct = total_pnl / total_invested * 100
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Invested", f"PKR {round(total_invested, 2)}")
+            c2.metric("Current", f"PKR {round(total_current, 2)}")
+            c3.metric("P/L", f"PKR {round(total_pnl, 2)}")
+            c4.metric("P/L %", f"{round(total_pnl_pct, 2)}%")
+
+        port_df = pd.DataFrame(rows)
+        st.dataframe(port_df, use_container_width=True, hide_index=True)
+
+        remove_idx = st.selectbox(
+            "Remove holding",
+            options=["-"] + [h["ticker"] for h in st.session_state.portfolio]
+        )
+        if remove_idx != "-" and st.button("Remove Selected"):
+            st.session_state.portfolio = [
+                h for h in st.session_state.portfolio if h["ticker"] != remove_idx
+            ]
+            st.rerun()
+    else:
+        st.info("Koi holding nahi. Upar add karo (max 5).")
+
+
+# ============================================================
+# MARKET TAB
+# ============================================================
+
+with tab_market:
+    st.subheader("📈 Market Overview")
+
+    market = market_snapshot()
+
+    if market["regime"] == "UNAVAILABLE":
+        st.warning("🔴 KSE-100: DATA UNAVAILABLE")
+        st.caption(f"Source: {market['source']}")
+        st.caption("Koi provider se KSE-100 data nahi mila.")
+    else:
+        fresh, _, fresh_warn = get_freshness_status(market["last_date"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Regime", market["regime"])
+        c2.metric("Trend", market["trend"])
+        c3.metric("KSE-100 Level", round(market["last_close"], 2) if market["last_close"] else "N/A")
+
+        st.caption(f"Source: {market['source']} | Last: {market['last_date'].date() if market['last_date'] else 'N/A'} ({fresh})")
+        if fresh == "STALE":
+            st.warning(f"🔴 {fresh_warn}")
+
+        st.info(f"**Reasoning:** {market['reasoning']}")
+
+        idx_df, _ = fetch_market_index()
+        if idx_df is not None and len(idx_df) > 30:
+            idx_df["SMA20"] = sma(idx_df["Close"], 20)
+            idx_df["SMA50"] = sma(idx_df["Close"], 50)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=idx_df.index, y=idx_df["Close"],
+                                     line=dict(color="#3B82F6", width=2), name="KSE-100"))
+            fig.add_trace(go.Scatter(x=idx_df.index, y=idx_df["SMA20"],
+                                     line=dict(color="#F59E0B", width=1.5, dash="dot"), name="SMA20"))
+            fig.add_trace(go.Scatter(x=idx_df.index, y=idx_df["SMA50"],
+                                     line=dict(color="#8B5CF6", width=1.5, dash="dot"), name="SMA50"))
+            fig.update_layout(template="plotly_white", height=400,
+                              margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("📊 PSX Market Proxy")
+    st.caption("⚠️ PROXY — NOT official KSE-100")
+
+    proxy = liquid_basket_trend()
+    if proxy["change_pct"] is not None:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Proxy Trend", proxy["trend"])
+        c2.metric("Avg Change (5d)", f"{proxy['change_pct']}%")
+        c3.metric("Stocks Contributing", proxy["stocks_contributing"])
+        st.caption(f"Note: {proxy['note']}")
+    else:
+        st.info("Proxy unavailable")
+
+    with st.expander("🔍 Provider Diagnostics"):
+        diag = pd.DataFrame([
+            {
+                "Provider": k,
+                "Available": "✅" if v["available"] else "❌",
+                "Coverage": v["coverage"],
+                "KSE-100": "✅" if v["kse100"] else "❌",
+                "Last Success": v["last_success"].strftime("%d-%b %H:%M") if v["last_success"] else "Never",
+                "Last Attempt": v["last_fetch_attempt"].strftime("%d-%b %H:%M") if v["last_fetch_attempt"] else "Never",
+                "Error": (v["error"][:80] if v["error"] else "-"),
+            }
+            for k, v in PROVIDER_STATUS.items()
+        ])
+        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.caption("⚠️ Diagnostics = actual network fetches only. Cache purani info de sakti hai.")
+
+
+# ============================================================
+# TOP PICKS TAB
+# ============================================================
+
+with tab_top:
+    st.subheader("🎯 Top Picks — Day Trade & Swing Trade")
+    st.caption("⚠️ Sab estimates technical hain. Guaranteed returns nahi.")
+
+    if "screener_df" not in st.session_state:
+        st.info("Pehle Screener tab pe 'Run Screener' chalao — Top Picks usi data pe based hai.")
+    else:
+        df_s = st.session_state["screener_df"]
+        with st.spinner("Categorizing..."):
+            picks = categorize_top_picks(
+                df_s, penny_threshold=penny_threshold, rvol_threshold=rvol_threshold
+            )
+
+        st.markdown("### ⚡ Day Trade Candidates")
+        st.caption("High momentum + breakout structure — 1-2 sessions")
+
+        if picks["day"].empty:
+            st.info("Koi day-trade candidate nahi mila.")
+        else:
+            day_cols = ["Ticker", "Price", "Change %", "Score", "Signal",
+                        "Status", "RR", "Hold Estimate", "Basis"]
+            day_cols = [c for c in day_cols if c in picks["day"].columns]
+            st.dataframe(picks["day"][day_cols], use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        st.markdown("### 🌊 Swing Trade Candidates")
+        st.caption("Clear trend + room to run + R:R ≥ 1.5 — 5-15 sessions")
+
+        if picks["swing"].empty:
+            st.info("Koi swing-trade candidate nahi mila.")
+        else:
+            swing_cols = ["Ticker", "Price", "Trend", "Score", "Signal",
+                          "Status", "RR", "Hold Estimate", "Basis"]
+            swing_cols = [c for c in swing_cols if c in picks["swing"].columns]
+            st.dataframe(picks["swing"][swing_cols], use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.caption("**Hold Estimate** = ATR-based pace calculation. Technical estimate, guaranteed nahi.")
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.sidebar.caption("---")
+st.sidebar.caption(
+    "⚠️ **Disclaimer:** Signals analytical outputs hain historical price/volume "
+    "data pe based. Guaranteed investment advice NAHI. Apna research zaroor karo."
+)
+st.sidebar.caption(
+    "Data sourced from PSX Data Portal (dps.psx.com.pk) for personal, "
+    "non-commercial use. Commercial redistribution requires PSX license."
+)
+
+
+# ============================================================
+# END
+# ============================================================
