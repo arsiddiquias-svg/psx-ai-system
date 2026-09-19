@@ -1729,7 +1729,7 @@ with tab_breakouts:
 with tab_next:
     st.subheader("📅 Next Session Watchlist")
     st.caption("Next session ke top candidates — manual scan on demand")
-        if st.button("🔄 Refresh Next Session", use_container_width=True):
+    if st.button("🔄 Refresh Next Session", use_container_width=True):
         with st.spinner("Scanning candidates..."):
             # Use dynamic universe from PSX market-watch
             combined, uni_source = get_scan_universe()
