@@ -1,28 +1,33 @@
 """
-PSX QUANT ENGINE - v8.1
+PSX QUANT ENGINE - v8.3
 ========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.1:
-- Chart projection now follows projection_engine direction (bearish shows downside)
-- Indicator panel hides long-target fields when bearish
-- KSE-100 market chart sliced to ~2 years for display
-- Dynamic scan universe from PSX market-watch (500+ symbols)
-- Screener shows R:R gate column for signal clarity
-- Metric labels shortened to prevent truncation
+CHANGELOG v8.3:
+- Live PSX price override: when PSX market-watch has today's live price,
+  it overrides yfinance close for DISPLAY and P&L (not for indicators).
+- Clear UI labels: 📍 Live PSX vs 📅 yfinance close.
+- Previous fixes preserved (trend-aware projection, chart slice,
+  dynamic universe, Gate column, Portfolio freshness columns,
+  Day Trade Low-R:R badge).
 
 DATA SOURCES:
 - KSE-100 index: PSX official EOD -> yfinance fallback
-- Stock OHLCV:   psxdata (optional) -> yfinance
-- Market-watch:  PSX official HTML (used for reconciliation AND universe)
-- Scan universe: PSX official market-watch -> curated fallback
+- Stock OHLCV (indicators): psxdata (optional) -> yfinance
+- Market-watch: PSX official HTML (reconciliation + universe + live price)
+- Live display price: PSX official market-watch -> yfinance close fallback
+
+SAFETY:
+- Indicators (SMA/RSI/ATR/MACD/ADX/Bollinger/Trend/Breakout/Projection)
+  always use yfinance historical series — never overridden.
+- Only the DISPLAYED price and P&L use the live PSX price override.
 
 STARTUP POLICY:
 - Heavy scans are USER-TRIGGERED ONLY via explicit buttons.
 - No automatic universe scans on first render.
 
 DEPLOYMENT:
-- Python 3.11 or 3.12 recommended (see requirements.txt notes)
+- Python 3.11 or 3.12 recommended
 """
 
 import streamlit as st
@@ -42,7 +47,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.1",
+    page_title="PSX Quant Engine v8.3",
     page_icon="📈",
     layout="wide"
 )
@@ -87,10 +92,11 @@ h2, h3 { margin-top: 0.5rem !important; }
 # ============================================================
 
 MIN_RR = 1.5
+DAY_TRADE_MIN_RR = 1.0
 PENNY_STOCK_THRESHOLD = 50
 MIN_HISTORY_DAYS = 60
 CACHE_TTL = 300
-CHART_DISPLAY_BARS = 504  # ~2 trading years for chart display
+CHART_DISPLAY_BARS = 504  # ~2 trading years
 
 WEIGHTS = {"trend": 0.25, "momentum": 0.20, "volume": 0.15, "setup": 0.20, "rr": 0.10, "sr": 0.10}
 
@@ -160,7 +166,6 @@ def normalize_ticker_display(raw: str) -> str:
     return raw.strip().upper().replace(".KA", "")
 
 def trading_days_between(date1, date2):
-    """Mon-Fri business-day count. PSX holidays NOT accounted for — approximate."""
     try:
         return int(np.busday_count(date1.date(), date2.date()))
     except Exception:
@@ -187,7 +192,7 @@ def get_freshness_status(data_date):
 PSX_BASE = "https://dps.psx.com.pk"
 PSX_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 PSXQuantEngine/8.1 (personal research)")
+    "Chrome/124.0 Safari/537.36 PSXQuantEngine/8.3 (personal research)")
 
 _LAST_PSX_REQUEST_TS = 0.0
 _PSX_MIN_INTERVAL = 1.0
@@ -255,7 +260,7 @@ def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optiona
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]:
-    """Market-watch HTML scrape. Defensive parsing. Also used as scan universe source."""
+    """Market-watch HTML scrape. Used for universe, reconciliation, and live price."""
     url = f"{PSX_BASE}/market-watch"
     try:
         resp = _psx_get(url)
@@ -292,16 +297,38 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
         return None, "EXCEPTION", f"Market-watch error: {str(e)[:120]}"
 
 # ============================================================
+# LIVE PSX PRICE (display + P&L override only)
+# ============================================================
+
+def get_live_psx_price(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns today's live PSX official price for a ticker, if available in market-watch.
+    Gracefully returns None if market-watch fails or ticker not found.
+    Pure display/P&L layer — NOT used for indicator calculation.
+    """
+    try:
+        mw, status, _ = fetch_psx_official_market_watch()
+        if status != "SUCCESS" or mw is None:
+            return None
+        sym = normalize_ticker_display(ticker)
+        row = mw[mw["Symbol"] == sym]
+        if row.empty or pd.isna(row.iloc[0].get("Current")):
+            return None
+        return {
+            "price": float(row.iloc[0]["Current"]),
+            "date": pkt_now().date(),
+            "source": "psx_official_live",
+        }
+    except Exception:
+        return None
+
+# ============================================================
 # SCAN UNIVERSE (dynamic from PSX market-watch)
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_scan_universe() -> Tuple[List[str], str]:
-    """
-    Primary: PSX official market-watch (all listed symbols, typically 400-600).
-    Fallback: curated PSX_FALLBACK_UNIVERSE (~59 symbols).
-    Returns (ticker_list, source_label).
-    """
+    """Primary: PSX official market-watch. Fallback: curated list."""
     mw, status, _ = fetch_psx_official_market_watch()
     if status == "SUCCESS" and mw is not None and len(mw) > 100:
         symbols = mw["Symbol"].dropna().unique().tolist()
@@ -383,7 +410,6 @@ def _flatten_columns(df):
     return df
 
 def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
-    """Full OHLCV integrity check."""
     if df is None or df.empty: return False, "Empty DataFrame"
     required = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in required if c not in df.columns]
@@ -421,7 +447,7 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame]
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_market_index():
-    """KSE-100: PSX official first, yfinance fallback. Label truthful."""
+    """KSE-100: PSX official first, yfinance fallback."""
     df, status, err = fetch_psx_official_index_json("KSE100")
     if status == "SUCCESS" and df is not None and len(df) >= 40:
         last_close = float(df["Close"].iloc[-1])
@@ -447,7 +473,7 @@ def fetch_market_index():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_universe() -> Tuple[List[str], str, str]:
-    """Legacy wrapper — now prefers market-watch via get_scan_universe."""
+    """Legacy wrapper — prefers market-watch."""
     try:
         import psxdata
         tickers = psxdata.tickers()
@@ -464,7 +490,7 @@ def fetch_universe() -> Tuple[List[str], str, str]:
 # ============================================================
 
 def reconcile_psx_vs_yf(ticker: str, yf_df: pd.DataFrame) -> Dict[str, Any]:
-    """PSX vs yfinance comparison, date-aware. Mark not_comparable when dates differ."""
+    """PSX vs yfinance comparison, date-aware."""
     out = {"mismatch": False, "diff_pct": None, "psx_price": None, "yf_price": None,
            "source_used": "yfinance", "note": None, "not_comparable": False}
     if yf_df is None or len(yf_df) == 0:
@@ -504,11 +530,7 @@ def sma(series, period): return series.rolling(period).mean()
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
-    """
-    Wilder RSI. Single EWM smoothing (matches atr()/adx() pattern).
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    """
+    """Wilder RSI. Single EWM smoothing."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
@@ -552,7 +574,6 @@ def adx(df, period=14):
     return adx_val.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
 
 def bollinger(series, period=20, num_std=2):
-    """Standard Bollinger Bands. ddof=1 (TradingView-compatible sample std)."""
     mid = sma(series, period)
     std = series.rolling(period).std(ddof=1)
     return mid + num_std * std, mid, mid - num_std * std
@@ -578,7 +599,6 @@ def build_indicators(df):
     d["RETURN_1D"] = d["Close"].pct_change()
     d["ROC_10"] = d["Close"].pct_change(10) * 100
     d["VOLATILITY_20"] = d["RETURN_1D"].rolling(20).std() * np.sqrt(252)
-    # 52W requires FULL 252 sessions. No partial-year fallback.
     d["52W_HIGH"] = d["High"].shift(1).rolling(252, min_periods=252).max()
     d["52W_LOW"] = d["Low"].shift(1).rolling(252, min_periods=252).min()
     return d
@@ -637,7 +657,6 @@ def support_resistance(d):
             "secondary_resistance_is_distinct": secondary_resistance != primary_resistance}
 
 def breakout_engine(d, sr, vol_ratio_threshold=1.5):
-    """No look-ahead. Current candle excluded. Fresh vs continuation vs near."""
     last = d.iloc[-1]
     prev = d.iloc[-2] if len(d) >= 2 else last
     prior = d.iloc[:-1] if len(d) > 1 else d
@@ -731,12 +750,6 @@ def momentum_engine(d):
             "overbought": last["RSI14"] > 70, "oversold": last["RSI14"] < 30}
 
 def projection_engine(d, trend, sr, momentum):
-    """
-    Trend-aware projection.
-    Bullish -> Upside zone.
-    Bearish -> Downside zone.
-    Neutral -> None.
-    """
     last = d.iloc[-1]; price = last["Close"]
     atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
     resistance = sr["primary_resistance"]; support = sr["primary_support"]
@@ -796,7 +809,6 @@ def detect_penny_setup(d, sr, threshold=PENNY_STOCK_THRESHOLD, rvol_threshold=2.
             "broke_resistance": broke_resistance, "rvol_expansion": rvol_expansion}
 
 def risk_engine(d, sr, breakout_status=""):
-    """Returns error field if invalid. Never invents a stop. LONG-ONLY direction."""
     last = d.iloc[-1]; price = last["Close"]
     atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
     if price is None or price <= 0:
@@ -911,7 +923,6 @@ def signal_engine(d, trend, trend_score, momentum, breakout, pullback, sr, risk_
     elif market["regime"] == "HIGH VOLATILITY": market_adjust = -5
     adjusted_score = max(0, min(100, score + market_adjust))
     reasons = []
-    # Gate tracking for UI clarity
     gate = "none"
     if not trend_ok:
         gate = "trend"
@@ -1052,6 +1063,17 @@ def analyze_stock(ticker: str, period: str = "1y",
         "cap_size": cap_size, "data_source": source, "avg_volume": avg_volume,
         "reconciliation": reconcile_psx_vs_yf(ticker, df),
     }
+    # DISPLAY PRICE OVERRIDE — prefer PSX live over yfinance close for shown price only.
+    # Indicators above still use result["last"]["Close"] (yfinance historical).
+    live = get_live_psx_price(ticker)
+    if live is not None:
+        result["display_price"] = live["price"]
+        result["display_price_source"] = "psx_official_live"
+        result["display_price_date"] = live["date"]
+    else:
+        result["display_price"] = float(last["Close"])
+        result["display_price_source"] = "yfinance_historical"
+        result["display_price_date"] = result["data_date"]
     return result, "SUCCESS", None, source
 
 def run_screener(universe: List[str], period: str = "1y",
@@ -1061,7 +1083,6 @@ def run_screener(universe: List[str], period: str = "1y",
     rows = []
     coverage = {"total": len(universe), "success": 0, "failed": 0, "analyzed": 0}
     total = len(universe)
-    # Fetch market ONCE per scan (was: once per stock)
     if market is None:
         market = market_snapshot()
     for idx, ticker in enumerate(universe):
@@ -1076,7 +1097,8 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Score": None, "Signal": "ERROR", "Gate": "n/a",
                 "Status": "DATA UNAVAILABLE",
                 "Penny": None, "Cap Size": None, "Source": source, "Why": "Data unavailable",
-                "Avg Volume": None, "RR": None, "_ticker_raw": ticker})
+                "Avg Volume": None, "RR": None, "RR Flag": "",
+                "_ticker_raw": ticker})
             continue
         coverage["success"] += 1
         coverage["analyzed"] += 1
@@ -1095,19 +1117,29 @@ def run_screener(universe: List[str], period: str = "1y",
             why_parts.insert(0, result["penny"]["note"])
         why_text = " + ".join(why_parts[:4]) if why_parts else "No clear setup"
         avg_volume = result["avg_volume"] if not pd.isna(result["avg_volume"]) else 0
-        # Gate label for clarity (BUG 3 clarification)
         gate = result["signal"].get("gate", "none")
         gate_label = {"trend": "trend-gate", "rr": "R:R-gate", "none": "-"}.get(gate, "-")
+        rr_val = result["risk"]["rr1"]
+        rr_badge = ""
+        if rr_val is not None:
+            if rr_val < DAY_TRADE_MIN_RR:
+                rr_badge = "⚠️ Low R:R"
+            elif rr_val < MIN_RR:
+                rr_badge = "low-mid R:R"
         rows.append({
-            "Ticker": result["ticker_display"], "Price": round(last["Close"], 2),
+            "Ticker": result["ticker_display"],
+            "Price": round(result["display_price"], 2),
             "Change %": round(change_pct, 2), "Trend": result["trend"],
             "Score": result["signal"]["score"], "Signal": result["signal"]["signal"],
             "Gate": gate_label,
             "Status": result["breakout"]["status"],
             "Penny": result["penny"]["status"] if result["penny"]["is_penny"] else "N/A",
-            "RR": round(result["risk"]["rr1"], 2) if result["risk"]["rr1"] else None,
+            "RR": round(rr_val, 2) if rr_val else None,
+            "RR Flag": rr_badge,
             "Cap Size": result["cap_size"], "Source": result["data_source"],
-            "Why": why_text, "Avg Volume": round(avg_volume, 0), "_ticker_raw": ticker,
+            "Price Src": "📍 PSX" if result["display_price_source"] == "psx_official_live" else "📅 yf",
+            "Why": why_text, "Avg Volume": round(avg_volume, 0),
+            "_ticker_raw": ticker,
         })
     return pd.DataFrame(rows), coverage
 
@@ -1131,7 +1163,7 @@ def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
 def categorize_top_picks(screener_df: pd.DataFrame,
                         penny_threshold: float = PENNY_STOCK_THRESHOLD,
                         rvol_threshold: float = 2.0) -> Dict[str, pd.DataFrame]:
-    """Day / Swing / Hold from existing screener data. No re-fetching."""
+    """Day / Swing / Hold. Day = transparent (no R:R filter, badge only)."""
     empty = pd.DataFrame()
     if screener_df is None or screener_df.empty:
         return {"day": empty, "swing": empty, "hold": empty}
@@ -1139,7 +1171,6 @@ def categorize_top_picks(screener_df: pd.DataFrame,
     if df.empty:
         return {"day": empty, "swing": empty, "hold": empty}
 
-    # DAY
     day_mask = (df["Status"].astype(str).str.contains("BREAKOUT|READY|ATTEMPT", case=False, na=False)
                 & (df["Score"].fillna(0) >= 55))
     day_df = df[day_mask].copy()
@@ -1147,8 +1178,9 @@ def categorize_top_picks(screener_df: pd.DataFrame,
         day_df = day_df.sort_values("Score", ascending=False).head(10)
         day_df["Hold Estimate"] = "1-2 sessions"
         day_df["Basis"] = "Momentum + breakout structure"
+        if "RR Flag" not in day_df.columns:
+            day_df["RR Flag"] = ""
 
-    # SWING
     swing_mask = (df["Trend"].astype(str).str.contains("BULLISH", case=False, na=False)
                   & (~df["Trend"].astype(str).str.contains("STRONG BULLISH", case=False, na=False))
                   & (df["RR"].fillna(0) >= 1.5) & (df["Score"].fillna(0) >= 45))
@@ -1158,7 +1190,6 @@ def categorize_top_picks(screener_df: pd.DataFrame,
         swing_df["Hold Estimate"] = "5-15 sessions (technical estimate)"
         swing_df["Basis"] = "Trend + R:R >= 1.5"
 
-    # HOLD
     hold_mask = (df["Trend"].astype(str).str.contains("STRONG BULLISH", case=False, na=False)
                  & (df["Score"].fillna(0) >= 60) & (df["RR"].fillna(0) >= 1.5))
     hold_df = df[hold_mask].copy()
@@ -1174,7 +1205,6 @@ def categorize_top_picks(screener_df: pd.DataFrame,
 # ============================================================
 
 def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
-    """Original + technical + active stop. None-safe."""
     if result is None: return "WATCH", "Data unavailable"
     signal = result["signal"]["signal"]; trend = result["trend"]
     pullback = result["pullback"]["status"]; breakout = result["breakout"]["status"]
@@ -1186,7 +1216,7 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
     elif original_stop is not None: active_stop = original_stop
     elif technical_stop is not None: active_stop = technical_stop
     else: return "WATCH", "⚠️ Stop-loss data unavailable — cannot make exit decision"
-    current_price = result["last"]["Close"]
+    current_price = result["display_price"]
     entry_price = holding["buy_price"]
     pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price else 0
     if current_price < active_stop: return "EXIT", f"❌ Price {current_price} < active stop {active_stop}"
@@ -1267,7 +1297,6 @@ def build_chart(result, show_bb=False, show_sma200=False,
         fig.add_hline(y=sr["primary_support"], line_dash="dash",
             line_color="#10B981", annotation_text="Support", row=row, col=1)
 
-    # Stop / T1 lines: only when signal is long (STRONG BUY or BUY)
     if is_long_signal:
         if risk.get("stop_loss") and risk["stop_loss"] > 0:
             fig.add_hline(y=risk["stop_loss"], line_dash="dot",
@@ -1276,9 +1305,7 @@ def build_chart(result, show_bb=False, show_sma200=False,
             fig.add_hline(y=risk["target1"], line_dash="dot",
                 line_color="#3B82F6", annotation_text="T1", row=row, col=1)
 
-    # ---- PROJECTION ARROW: trend-aware ----
-    # Uses projection_engine zone (bullish->upside, bearish->downside).
-    # Skips when direction is NEUTRAL.
+    # Trend-aware projection arrow
     try:
         proj_dir = proj.get("direction")
         proj_low = proj.get("zone_low")
@@ -1289,7 +1316,6 @@ def build_chart(result, show_bb=False, show_sma200=False,
             last_date = d.index[-1]
             future_dates = pd.bdate_range(start=last_date, periods=13, freq="B")[1:]
             current_price = float(d["Close"].iloc[-1])
-            # Projection target = far edge of the zone (most informative single point)
             target_price = float(proj_high) if proj_dir == "UP" else float(proj_low)
             n = len(future_dates)
             if n > 0:
@@ -1339,7 +1365,6 @@ def build_chart(result, show_bb=False, show_sma200=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         template="plotly_white")
     return fig
-
 # ============================================================
 # UI HELPERS
 # ============================================================
@@ -1373,6 +1398,16 @@ def get_indicator_explanation(indicator: str) -> str:
     }
     return explanations.get(indicator, "Technical indicator.")
 
+def _style_portfolio_row(row):
+    """Highlight STALE (pink) and DELAYED (yellow) rows."""
+    styles = [""] * len(row)
+    freshness = str(row.get("Freshness", "")).upper()
+    if freshness == "STALE":
+        styles = ["background-color: #FEE2E2; color: #7F1D1D;"] * len(row)
+    elif freshness == "DELAYED":
+        styles = ["background-color: #FEF3C7; color: #78350F;"] * len(row)
+    return styles
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -1381,7 +1416,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.1</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.3</div>", unsafe_allow_html=True)
 
 st.sidebar.subheader("🔌 Provider Status")
 psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
@@ -1422,11 +1457,10 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     st.sidebar.success("Cache cleared!")
 
 st.sidebar.caption("KSE-100: PSX Official → yfinance | Stock OHLCV: psxdata → yfinance")
-st.sidebar.caption("Market-watch: PSX Official HTML | Scan universe: PSX market-watch")
+st.sidebar.caption("Market-watch: PSX Official HTML | Live price: PSX → yfinance close")
 st.sidebar.caption("Cache: 5min | Universe: 60min")
 st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
 
-# Session state init
 if "portfolio" not in st.session_state: st.session_state.portfolio = []
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = "SYS, OGDC, HBL, LUCK, FFC, ENGRO"
@@ -1462,13 +1496,15 @@ with tab_dash:
         recon = result.get("reconciliation", {})
         if recon.get("mismatch"):
             st.warning(f"⚠️ Price mismatch — PSX: {recon['psx_price']} | "
-                       f"yfinance: {recon['yf_price']} | farq {recon['diff_pct']}% "
-                       f"(PSX official use ho raha hai)")
+                       f"yfinance: {recon['yf_price']} | farq {recon['diff_pct']}%")
         elif recon.get("not_comparable"):
             st.caption(f"ℹ️ Reconciliation: {recon.get('note', 'not comparable')}")
+
         col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.2, 1.2, 1.2])
         with col1:
-            st.markdown(f"<span class='current-price'>{round(last['Close'], 2)}</span>",
+            # DISPLAY PRICE (PSX live override when available)
+            disp_price = result["display_price"]
+            st.markdown(f"<span class='current-price'>{round(disp_price, 2)}</span>",
                 unsafe_allow_html=True)
             prev_close = result["df"]["Close"].iloc[-2] if len(result["df"]) >= 2 else last["Close"]
             change = last["Close"] - prev_close
@@ -1478,6 +1514,11 @@ with tab_dash:
                 f"{round(change, 2)} ({round(change_pct, 2)}%)</span>", unsafe_allow_html=True)
             st.caption(f"{result['ticker_display']} · {result['cap_size']}")
             st.caption(f"Data: {source} · {freshness_status} · {result['data_date'].date()}")
+            # Live price source label
+            if result["display_price_source"] == "psx_official_live":
+                st.caption(f"📍 Live PSX price (aaj) · {result['display_price_date']}")
+            else:
+                st.caption(f"📅 Last yfinance close · {result['display_price_date']}")
         with col2:
             sc = get_signal_class(sig["signal"])
             st.markdown("**Signal**")
@@ -1489,6 +1530,7 @@ with tab_dash:
         with col5:
             st.metric("Setup", sig["setup_quality"],
                 help="Setup quality based on score + trend alignment (not statistical confidence)")
+
         mkt = result["market"]
         if mkt["regime"] != "UNAVAILABLE":
             st.caption(f"📊 KSE-100: {mkt['regime']} | Level: "
@@ -1496,8 +1538,10 @@ with tab_dash:
             st.caption(f"Source: {mkt['source']}")
         else:
             st.caption("📊 KSE-100: DATA UNAVAILABLE")
+
         with st.expander("🔍 Why this signal?", expanded=True):
             for r in sig["reasons"]: st.write(r)
+
         st.subheader("📋 Trade Plan")
         risk = result["risk"]
         if is_bearish:
@@ -1514,13 +1558,16 @@ with tab_dash:
             c5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
             if risk.get("conditional_entry") is not None:
                 st.caption(f"💡 Better Entry: {risk['conditional_entry']} — {risk['conditional_entry_note']}")
+
         proj = result["projection"]
         if proj["direction"] != "NEUTRAL":
             dir_emoji = "📈" if proj["direction"] == "UP" else "📉"
             st.info(f"{dir_emoji} **Technical Projection ({proj['direction']}):** {proj['label']}")
             st.caption(proj["note"])
+
         if result["penny"]["is_penny"]:
             st.warning(f"🪙 {result['penny']['status']} - {result['penny']['note']}")
+
         st.subheader("📊 Chart")
         c1, c2, c3, c4, c5 = st.columns(5)
         show_bb = c1.checkbox("Bollinger Bands", value=False)
@@ -1530,8 +1577,8 @@ with tab_dash:
         show_macd = c5.checkbox("MACD", value=False)
         st.plotly_chart(build_chart(result, show_bb, show_sma200, show_sr, show_rsi, show_macd),
             use_container_width=True)
-        st.caption("📉 **Projection line** follows trend direction (bullish=upward, bearish=downward). "
-                   "Technical estimate, market forecast nahi.")
+        st.caption("📉 **Projection line** follows trend direction. Technical estimate, not guarantee.")
+
         with st.expander("📖 Indicator Explanations"):
             st.markdown(f"**SMA20:** {get_indicator_explanation('SMA20')} (Current: {round(last['SMA20'],2)})")
             st.markdown(f"**SMA50:** {get_indicator_explanation('SMA50')} (Current: {round(last['SMA50'],2)})")
@@ -1552,6 +1599,7 @@ with tab_dash:
                 st.markdown(f"**Target:** {get_indicator_explanation('Target')} "
                     f"({round(risk['target1'],2) if risk['target1'] else 'N/A'})")
             st.markdown(f"**ATR:** {get_indicator_explanation('ATR')} (Current: {round(last['ATR14'],2)})")
+
         with st.expander("📊 Support / Resistance Details"):
             sr = result["sr"]
             cc1, cc2, cc3, cc4 = st.columns(4)
@@ -1573,17 +1621,13 @@ with tab_dash:
 
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
-
-    # Universe choice: dynamic (PSX market-watch) or curated subsets
     universe_option = st.selectbox("Universe",
         ["Dynamic (PSX official market-watch)", "Liquid PSX (~34)", "Small Cap (~25)", "Custom (from watchlist)"],
         index=0)
-
     col1, col2 = st.columns(2)
     with col1: custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
     with col2: scan_full = st.checkbox("Scan full dynamic universe (slow, 500+ symbols, 10+ min)",
         value=False, help="Default scans first 100 symbols for speed")
-
     st.markdown("**Filters**")
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -1628,15 +1672,12 @@ with tab_screener:
                         for t in custom_syms.split(",") if t.strip()]
                 universe = list(dict.fromkeys(universe + extra))
                 uni_source += f" + {len(extra)} extra"
-
             if not scan_full and len(universe) > 100:
                 total_count = len(universe)
                 universe = universe[:100]
-                st.caption(f"📊 Scanning first 100 of {total_count} ({uni_source}). "
-                           f"Enable full scan for all.")
+                st.caption(f"📊 Scanning first 100 of {total_count} ({uni_source}).")
             else:
                 st.caption(f"📊 Scanning {len(universe)} symbols ({uni_source})")
-
         with st.spinner("Scanning PSX universe..."):
             market = market_snapshot()
             screener_df, coverage = run_screener(universe, period="1y",
@@ -1676,8 +1717,9 @@ with tab_screener:
         penny_count = len(view[view["Penny"].notna() & (view["Penny"] != "N/A")])
         st.caption(f"📊 Showing **{len(view)}** of {total_scanned} scanned"
             + (f" ({penny_count} penny stocks)" if include_penny and penny_count > 0 else ""))
-        st.caption("ℹ️ **Gate** column batata hai ke signal kyun WAIT/REDUCE hua: "
-                   "**trend-gate** = bearish structure, **R:R-gate** = reward:risk < 1.5")
+        st.caption("ℹ️ **Gate** column shows why signal became WAIT/REDUCE. "
+                   "**RR Flag** shows low reward:risk warnings. "
+                   "**Price Src** shows 📍 PSX live vs 📅 yfinance close.")
         if not view.empty:
             display_cols = [c for c in view.columns if not c.startswith("_")]
             st.dataframe(view[display_cols], use_container_width=True, hide_index=True)
@@ -1706,6 +1748,7 @@ with tab_breakouts:
                 if status == "SUCCESS":
                     breakout_rows.append({
                         "Ticker": row["Ticker"], "Price": row["Price"],
+                        "Price Src": row.get("Price Src", "📅 yf"),
                         "Change %": row["Change %"], "Trend": row["Trend"],
                         "Score": row["Score"], "Signal": row["Signal"],
                         "Gate": row.get("Gate", "-"),
@@ -1714,6 +1757,7 @@ with tab_breakouts:
                         "Dist %": round(result["breakout"]["distance_to_resistance"], 2)
                                     if result["breakout"]["distance_to_resistance"] is not None else "N/A",
                         "Momentum": result["momentum"]["label"], "RR": row["RR"],
+                        "RR Flag": row.get("RR Flag", ""),
                         "52W": "🚀 BREAKOUT" if result["breakout"]["is_52w_high_breakout"]
                                else "🔵 NEAR" if result["breakout"]["is_near_52w_high"] else "-",
                         "Why": row["Why"]})
@@ -1723,7 +1767,7 @@ with tab_breakouts:
             else: st.info("Koi detailed breakout data available nahi.")
 
 # ============================================================
-# NEXT SESSION TAB (BUTTON-ONLY — no auto scan)
+# NEXT SESSION TAB (button-only, 100-cap)
 # ============================================================
 
 with tab_next:
@@ -1731,7 +1775,6 @@ with tab_next:
     st.caption("Next session ke top candidates — manual scan on demand")
     if st.button("🔄 Refresh Next Session", use_container_width=True):
         with st.spinner("Scanning candidates..."):
-            # Use dynamic universe from PSX market-watch
             combined, uni_source = get_scan_universe()
             st.caption(f"Universe: {uni_source}")
             if len(combined) > 100:
@@ -1763,6 +1806,7 @@ with tab_next:
                     fresh, _, _ = get_freshness_status(result["data_date"])
                 else: trade_type, pace, fresh = "N/A", "N/A", "UNAVAILABLE"
                 rows.append({"Ticker": row["Ticker"], "Price": row["Price"],
+                    "Price Src": row.get("Price Src", "📅 yf"),
                     "Trend": row["Trend"], "Score": row["Score"], "Signal": row["Signal"],
                     "Status": row["Status"], "RR": row["RR"], "Trade Type": trade_type,
                     "Est. Pace": pace, "Setup Quality": sq, "Data": fresh, "Why": row["Why"]})
@@ -1797,21 +1841,22 @@ with tab_watch:
     if "watchlist_df" in st.session_state:
         df_w = st.session_state["watchlist_df"]
         if not df_w.empty:
-            cols = ["Ticker", "Price", "Change %", "Trend", "Score", "Signal", "Gate",
-                    "Status", "RR", "Cap Size", "Source", "Why"]
+            cols = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal", "Gate",
+                    "Status", "RR", "RR Flag", "Cap Size", "Source", "Why"]
             cols = [c for c in cols if c in df_w.columns]
             st.dataframe(df_w[cols], use_container_width=True, hide_index=True)
         else: st.info("Watchlist empty ya koi data nahi mila")
     else: st.info("Click 'Refresh Analysis' to analyze")
 
 # ============================================================
-# PORTFOLIO TAB
+# PORTFOLIO TAB (with display_price + freshness)
 # ============================================================
 
 with tab_port:
     st.subheader("💼 Portfolio Tracker (max 5)")
     st.caption("Active Stop = max(Original Stop, Technical Stop) for long positions")
-    st.caption("⚠️ Agar stop-loss data unavailable ho, decision 'WATCH' hoga")
+    st.caption("📍 = PSX live price (aaj) · 📅 = yfinance last close · "
+               "STALE rows (pink) — data purana hai, caution ke saath lein.")
     with st.form("add_holding"):
         c1, c2, c3, c4 = st.columns(4)
         h_ticker = c1.text_input("Ticker")
@@ -1837,7 +1882,8 @@ with tab_port:
             invested = h["buy_price"] * h["shares"]
             total_invested += invested
             if status == "SUCCESS":
-                cur_price = result["last"]["Close"]
+                # P&L uses display_price (PSX live override when available)
+                cur_price = result["display_price"]
                 cur_value = cur_price * h["shares"]
                 total_current += cur_value
                 pnl = cur_value - invested
@@ -1850,25 +1896,32 @@ with tab_port:
                 elif original_stop is not None: active_stop = original_stop
                 elif technical_stop is not None: active_stop = technical_stop
                 else: active_stop = None
+                fresh_status, _, _ = get_freshness_status(result["data_date"])
+                data_date_str = result["data_date"].strftime("%Y-%m-%d") if result["data_date"] is not None else "N/A"
+                price_src = "📍 PSX" if result.get("display_price_source") == "psx_official_live" else "📅 yf"
                 rows.append({"Ticker": result["ticker_display"], "Buy": h["buy_price"],
                     "Shares": h["shares"], "Invested": round(invested, 2),
-                    "Current": round(cur_price, 2), "Value": round(cur_value, 2),
+                    "Current": round(cur_price, 2), "Price Src": price_src,
+                    "Value": round(cur_value, 2),
                     "P/L": round(pnl, 2), "P/L %": round(pnl_pct, 2),
                     "Trend": result["trend"], "Signal": result["signal"]["signal"],
                     "Original Stop": round(original_stop, 2) if original_stop else "N/A",
                     "Technical Stop": round(technical_stop, 2) if technical_stop else "N/A",
                     "Active Stop": round(active_stop, 2) if active_stop else "N/A",
                     "Target 1": round(result["risk"]["target1"], 2) if result["risk"]["target1"] else "N/A",
+                    "Data Date": data_date_str,
+                    "Freshness": fresh_status,
                     "Decision": decision, "Reason": reason})
             else:
                 rows.append({"Ticker": h["ticker"], "Buy": h["buy_price"],
                     "Shares": h["shares"], "Invested": round(invested, 2),
-                    "Current": "N/A", "Value": "N/A", "P/L": "N/A", "P/L %": "N/A",
+                    "Current": "N/A", "Price Src": "N/A",
+                    "Value": "N/A", "P/L": "N/A", "P/L %": "N/A",
                     "Trend": None, "Signal": "ERROR",
                     "Original Stop": h.get("original_stop_loss", "N/A"),
                     "Technical Stop": None, "Active Stop": None, "Target 1": None,
+                    "Data Date": "N/A", "Freshness": "UNAVAILABLE",
                     "Decision": "WATCH", "Reason": error})
-        # Valuation summary with PARTIAL detection
         successful_holdings = sum(1 for r in rows if r["Current"] != "N/A")
         total_holdings = len(rows)
         if total_holdings == 0: pass
@@ -1888,7 +1941,13 @@ with tab_port:
             c3.metric("P/L", f"PKR {round(total_pnl, 2)}")
             c4.metric("P/L %", f"{round(total_pnl_pct, 2)}%")
         port_df = pd.DataFrame(rows)
-        st.dataframe(port_df, use_container_width=True, hide_index=True)
+        try:
+            styled = port_df.style.apply(_style_portfolio_row, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(port_df, use_container_width=True, hide_index=True)
+        st.caption("**Freshness legend:** FRESH = 0-1 business days · "
+                   "DELAYED = 2-3 · STALE = >3 (pink highlight).")
         remove_idx = st.selectbox("Remove holding",
             options=["-"] + [h["ticker"] for h in st.session_state.portfolio])
         if remove_idx != "-" and st.button("Remove Selected"):
@@ -1898,7 +1957,7 @@ with tab_port:
     else: st.info("Koi holding nahi. Upar add karo (max 5).")
 
 # ============================================================
-# MARKET TAB (proxy button-only, chart sliced to 2 years)
+# MARKET TAB
 # ============================================================
 
 with tab_market:
@@ -1921,7 +1980,6 @@ with tab_market:
         st.info(f"**Reasoning:** {market['reasoning']}")
         idx_df, _ = fetch_market_index()
         if idx_df is not None and len(idx_df) > 30:
-            # SMA warm-up on full history, then slice for display (~2 years)
             idx_df = idx_df.copy()
             idx_df["SMA20"] = sma(idx_df["Close"], 20)
             idx_df["SMA50"] = sma(idx_df["Close"], 50)
@@ -1934,7 +1992,7 @@ with tab_market:
             fig.add_trace(go.Scatter(x=idx_disp.index, y=idx_disp["SMA50"],
                 line=dict(color="#8B5CF6", width=1.5, dash="dot"), name="SMA50"))
             fig.update_layout(template="plotly_white", height=400,
-                margin=dict(l=10, r=10, t=10, b=10),
+                margin=dict(l=10, r=10, t=30, b=10),
                 title=dict(text=f"KSE-100 — last {len(idx_disp)} sessions",
                            font=dict(size=13)))
             st.plotly_chart(fig, use_container_width=True)
@@ -1964,10 +2022,10 @@ with tab_market:
             "Error": (v["error"][:80] if v["error"] else "-")}
             for k, v in PROVIDER_STATUS.items()])
         st.dataframe(diag, use_container_width=True, hide_index=True)
-        st.caption("⚠️ Diagnostics = actual network fetches only. Cache purani info de sakti hai.")
+        st.caption("⚠️ Diagnostics = actual network fetches only.")
 
 # ============================================================
-# TOP PICKS TAB (button-only, 3 sections)
+# TOP PICKS TAB
 # ============================================================
 
 with tab_top:
@@ -1993,7 +2051,6 @@ with tab_top:
                 uni = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_UNIVERSE))
                 uni_source = f"Both ({len(uni)})"
             st.caption(f"Universe: {uni_source}")
-            # Cap to first 100 for speed unless user has already cached
             if len(uni) > 100:
                 st.caption(f"📊 Scanning first 100 of {len(uni)} for speed.")
                 uni = uni[:100]
@@ -2008,11 +2065,12 @@ with tab_top:
         picks = categorize_top_picks(df_s, penny_threshold=penny_threshold,
             rvol_threshold=rvol_threshold)
         st.markdown("### ⚡ Day Trade Candidates")
-        st.caption("High momentum + breakout structure — 1-2 sessions")
+        st.caption("High momentum + breakout structure — 1-2 sessions. "
+                   "⚠️ Low R:R = reward:risk < 1.0 (momentum play, not R:R play).")
         if picks["day"].empty: st.info("Koi day-trade candidate nahi mila.")
         else:
-            day_cols = ["Ticker", "Price", "Change %", "Score", "Signal", "Gate",
-                        "Status", "RR", "Hold Estimate", "Basis"]
+            day_cols = ["Ticker", "Price", "Price Src", "Change %", "Score", "Signal", "Gate",
+                        "Status", "RR", "RR Flag", "Hold Estimate", "Basis"]
             day_cols = [c for c in day_cols if c in picks["day"].columns]
             st.dataframe(picks["day"][day_cols], use_container_width=True, hide_index=True)
         st.divider()
@@ -2020,7 +2078,7 @@ with tab_top:
         st.caption("Clear trend + room to run + R:R ≥ 1.5 — 5-15 sessions")
         if picks["swing"].empty: st.info("Koi swing-trade candidate nahi mila.")
         else:
-            swing_cols = ["Ticker", "Price", "Trend", "Score", "Signal", "Gate",
+            swing_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal", "Gate",
                           "Status", "RR", "Hold Estimate", "Basis"]
             swing_cols = [c for c in swing_cols if c in picks["swing"].columns]
             st.dataframe(picks["swing"][swing_cols], use_container_width=True, hide_index=True)
@@ -2029,7 +2087,7 @@ with tab_top:
         st.caption("Established strong bullish trend — positional horizon")
         if picks["hold"].empty: st.info("Koi hold candidate nahi mila.")
         else:
-            hold_cols = ["Ticker", "Price", "Trend", "Score", "Signal", "Gate",
+            hold_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal", "Gate",
                          "Status", "RR", "Hold Estimate", "Basis"]
             hold_cols = [c for c in hold_cols if c in picks["hold"].columns]
             st.dataframe(picks["hold"][hold_cols], use_container_width=True, hide_index=True)
