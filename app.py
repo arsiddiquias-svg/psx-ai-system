@@ -1,15 +1,16 @@
 """
-PSX QUANT ENGINE - v8.5
-========================
+PSX QUANT ENGINE - v8.5.1
+==========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.5:
-- yfinance alternate suffix fallback (.KA -> bare -> .PK)
-- PSX live price sanity check (10x tolerance vs yfinance)
-- Confidence flag per stock (data quality + signal reliability)
-- Data-quality banner on Dashboard
-- Better troubleshooting hints
-- All prior fixes preserved
+CHANGELOG v8.5.1:
+- FIX: fetch_yfinance_ohlcv now returns 3-tuple (was 4-tuple — ValueError)
+- All v8.5 features preserved:
+  - Alternate yfinance suffix fallback (.KA -> bare -> .PK)
+  - PSX live price sanity check (10x tolerance)
+  - Confidence flag per stock (data quality + signal reliability)
+  - Data-quality banner on Dashboard
+  - Better troubleshooting hints
 
 CONFIDENCE LEVELS:
 - HIGH   : fresh data + PSX live + RR >= 1.5 + aligned trend
@@ -37,7 +38,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.5",
+    page_title="PSX Quant Engine v8.5.1",
     page_icon="📈",
     layout="wide"
 )
@@ -183,23 +184,17 @@ def get_freshness_status(data_date):
         return "STALE", trading_gap, f"~{trading_gap} business days old — STALE (approx)"
 
 # ============================================================
-# CONFIDENCE CALCULATION (NEW in v8.5)
+# CONFIDENCE CALCULATION
 # ============================================================
 
 def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
     """
-    Compute a data-quality + signal-reliability score for the user.
+    Compute a data-quality + signal-reliability score.
     Returns {'level': 'HIGH'|'MEDIUM'|'LOW', 'score': int, 'reasons': [...]}.
-
-    Rationale:
-    - HIGH   : fresh data + PSX live price available + RR >= 1.5 + trend aligned
-    - MEDIUM : 1-2 warnings (stale/DELAYED, low RR, mixed signals, missing PSX live)
-    - LOW    : stale data OR bearish trend OR major warnings
     """
     score = 0
     reasons = []
 
-    # Data freshness (most important)
     if freshness_status == "FRESH":
         score += 3
     elif freshness_status == "DELAYED":
@@ -209,13 +204,11 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score -= 3
         reasons.append("Data STALE (>3 business days old)")
 
-    # PSX live price availability
     if result.get("display_price_source") == "psx_official_live":
         score += 2
     else:
         reasons.append("PSX live price unavailable (using yfinance close)")
 
-    # Trend alignment
     trend = result.get("trend", "")
     if trend in ("BULLISH", "STRONG BULLISH"):
         score += 2
@@ -223,7 +216,6 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score -= 3
         reasons.append(f"Bearish trend ({trend}) — long entries risky")
 
-    # R:R
     rr1 = result.get("risk", {}).get("rr1")
     if rr1 is not None:
         if rr1 >= 2.0: score += 2
@@ -235,7 +227,6 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
             score -= 2
             reasons.append(f"R:R {round(rr1,2)} poor")
 
-    # Signal
     signal = result.get("signal", {}).get("signal", "")
     if signal in ("STRONG BUY", "BUY"):
         score += 2
@@ -248,7 +239,6 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score -= 2
         reasons.append("Signal AVOID")
 
-    # Market regime
     regime = result.get("market", {}).get("regime", "")
     if regime == "BULLISH":
         score += 1
@@ -259,7 +249,6 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score -= 1
         reasons.append("Market regime high volatility")
 
-    # Classify
     if score >= 7:
         level = "HIGH"
     elif score >= 2:
@@ -276,7 +265,7 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
 PSX_BASE = "https://dps.psx.com.pk"
 PSX_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 PSXQuantEngine/8.5 (personal research)")
+    "Chrome/124.0 Safari/537.36 PSXQuantEngine/8.5.1 (personal research)")
 
 _LAST_PSX_REQUEST_TS = 0.0
 _PSX_MIN_INTERVAL = 1.0
@@ -379,14 +368,13 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
         return None, "EXCEPTION", f"Market-watch error: {str(e)[:120]}"
 
 # ============================================================
-# LIVE PSX PRICE (with sanity check)
+# LIVE PSX PRICE
 # ============================================================
 
 def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """
     Returns today's live PSX official price for a ticker.
-    SANITY CHECK: reject if ratio > 10x or < 0.1x vs yfinance reference
-    (likely symbol mismatch — allows legit large moves like BERG 3x).
+    SANITY CHECK: reject if ratio > 10x or < 0.1x vs yfinance reference.
     """
     try:
         mw, status, _ = fetch_psx_official_market_watch()
@@ -424,6 +412,7 @@ def get_scan_universe() -> Tuple[List[str], str]:
 # ============================================================
 
 def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
+    """Returns 3-tuple: (df, status, error)."""
     try:
         import psxdata
         symbol = normalize_ticker_display(ticker)
@@ -463,6 +452,7 @@ def fetch_yfinance_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.D
     """
     Try multiple yfinance symbol formats for PSX stocks.
     PSX naming is inconsistent: some use .KA, some bare, some .PK.
+    Returns 3-tuple: (df, status, error).
     """
     base = ticker.strip().upper().replace(".KA", "").replace(".PK", "")
     if ticker.strip().upper().endswith(".KA"):
@@ -495,13 +485,13 @@ def fetch_yfinance_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.D
                 last_error = f"{symbol}: {msg}"
                 continue
             update_provider_status("yfinance", available=True, coverage=len(df))
-            return df, "SUCCESS", f"yfinance ({symbol})", "yfinance"
+            return df, "SUCCESS", f"yfinance ({symbol})"
         except Exception as e:
             last_error = f"{symbol}: {str(e)[:60]}"
             continue
 
     update_provider_status("yfinance", available=False, error=last_error)
-    return None, "EXCEPTION", f"yfinance failed: {last_error}", "UNAVAILABLE"
+    return None, "EXCEPTION", f"yfinance failed: {last_error}"
 
 def _flatten_columns(df):
     if df is None or df.empty: return df
@@ -541,6 +531,7 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str, str]:
+    """Returns 4-tuple: (df, status, error, source)."""
     provider_attempts = []
     df, status, error = fetch_psxdata_ohlcv(ticker, period)
     provider_attempts.append(f"psxdata: {status}")
@@ -1162,7 +1153,6 @@ def analyze_stock(ticker: str, period: str = "1y",
         "cap_size": cap_size, "data_source": source, "avg_volume": avg_volume,
         "reconciliation": reconcile_psx_vs_yf(ticker, df),
     }
-    # DISPLAY PRICE OVERRIDE (with 10x sanity check)
     live = get_live_psx_price(ticker, yf_reference_price=float(last["Close"]))
     if live is not None:
         result["display_price"] = live["price"]
@@ -1172,7 +1162,6 @@ def analyze_stock(ticker: str, period: str = "1y",
         result["display_price"] = float(last["Close"])
         result["display_price_source"] = "yfinance_historical"
         result["display_price_date"] = result["data_date"]
-    # CONFIDENCE CALCULATION (NEW in v8.5)
     fresh_status, _, _ = get_freshness_status(result["data_date"])
     result["confidence"] = calculate_confidence(result, fresh_status)
     return result, "SUCCESS", None, source
@@ -1531,24 +1520,11 @@ def _style_portfolio_row(row):
         styles = ["background-color: #FEF3C7; color: #78350F;"] * len(row)
     return styles
 
-def _conf_badge(level: str) -> str:
-    """Return emoji-prefixed confidence badge."""
-    if level == "HIGH": return "✅ HIGH"
-    if level == "MEDIUM": return "⚠️ MEDIUM"
-    if level == "LOW": return "❌ LOW"
-    return "N/A"
-
 def _render_data_quality_banner(result: Dict):
-    """
-    Renders a top-of-Dashboard banner explaining data quality.
-    Two banners:
-    1. Reconciliation mismatch (if actual same-session mismatch > 1%)
-    2. Confidence level (HIGH/MEDIUM/LOW) with reasons
-    """
+    """Top-of-Dashboard banner explaining data quality."""
     conf = result.get("confidence", {})
     level = conf.get("level", "N/A")
     reasons = conf.get("reasons", [])
-
     if level == "HIGH":
         st.success(f"✅ **Data Quality: HIGH** — Signal reliable, sab checks pass.")
     elif level == "MEDIUM":
@@ -1570,7 +1546,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.5</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.5.1</div>", unsafe_allow_html=True)
 
 st.sidebar.subheader("🔌 Provider Status")
 psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
@@ -1662,12 +1638,9 @@ with tab_dash:
         is_bearish = trend in ("BEARISH", "STRONG BEARISH")
         freshness_status, _, freshness_warning = get_freshness_status(result["data_date"])
 
-        # --- DATA QUALITY BANNER ---
         _render_data_quality_banner(result)
-
         show_stale_data_warning(freshness_status, freshness_warning)
 
-        # Reconciliation banner — only for actual mismatch (silent otherwise)
         recon = result.get("reconciliation", {})
         if recon.get("mismatch"):
             st.warning(f"⚠️ Price mismatch — PSX: {recon['psx_price']} | "
@@ -1675,7 +1648,6 @@ with tab_dash:
 
         col1, col2, col3, col4, col5 = st.columns([2, 1.5, 1.2, 1.2, 1.2])
         with col1:
-            # DISPLAY PRICE (PSX live override when available)
             disp_price = result["display_price"]
             st.markdown(f"<span class='current-price'>{round(disp_price, 2)}</span>",
                 unsafe_allow_html=True)
@@ -1703,7 +1675,6 @@ with tab_dash:
             st.metric("Setup", sig["setup_quality"],
                 help="Setup quality based on score + trend alignment (not statistical confidence)")
 
-        # Confidence detail expander
         conf = result.get("confidence", {})
         if conf.get("level"):
             with st.expander(f"🎯 Confidence: {conf['level']} (score {conf.get('score', 0)})", expanded=False):
@@ -1803,7 +1774,7 @@ with tab_dash:
                 st.caption("N/A — insufficient 52-week history (need ≥252 sessions)")
 
 # ============================================================
-# SCREENER TAB (safe guards + Confidence column)
+# SCREENER TAB
 # ============================================================
 
 with tab_screener:
@@ -1994,7 +1965,7 @@ with tab_breakouts:
                     st.info("Koi detailed breakout data available nahi.")
 
 # ============================================================
-# NEXT SESSION TAB (button-only, 100-cap)
+# NEXT SESSION TAB
 # ============================================================
 
 with tab_next:
