@@ -1,21 +1,18 @@
 """
-PSX QUANT ENGINE - v8.5.1
-==========================
+PSX QUANT ENGINE - v8.6
+========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.5.1:
-- FIX: fetch_yfinance_ohlcv now returns 3-tuple (was 4-tuple — ValueError)
-- All v8.5 features preserved:
-  - Alternate yfinance suffix fallback (.KA -> bare -> .PK)
-  - PSX live price sanity check (10x tolerance)
-  - Confidence flag per stock (data quality + signal reliability)
-  - Data-quality banner on Dashboard
-  - Better troubleshooting hints
-
-CONFIDENCE LEVELS:
-- HIGH   : fresh data + PSX live + RR >= 1.5 + aligned trend
-- MEDIUM : data available but warnings (stale/DELAYED, low RR, mixed signals)
-- LOW    : stale data, bearish trend, or missing critical data
+CHANGELOG v8.6:
+- FIX: PSX User-Agent cleaned (no bot-suffix). Was likely triggering
+       PSX anti-bot protection.
+- FIX: PSX requests now use persistent Session with homepage warm-up
+       (get cookies first, then hit API).
+- FIX: Screener default filter now includes "WAIT" so bearish market
+       doesn't show empty result.
+- REMOVE: Watchlist tab (unused).
+- PRESERVE: All v8.5.1 features — confidence, live PSX price override,
+            alternate yfinance suffix, all fixes from v7.x.
 
 DEPLOYMENT:
 - Python 3.11 or 3.12 recommended
@@ -38,7 +35,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.5.1",
+    page_title="PSX Quant Engine v8.6",
     page_icon="📈",
     layout="wide"
 )
@@ -75,9 +72,6 @@ div[data-testid="stExpander"] summary { color: #1E293B !important; font-weight: 
 [data-testid="stAlert"] { border-radius: 10px; border-left-width: 4px; }
 hr { border-color: #E2E8F0 !important; opacity: 1 !important; }
 h2, h3 { margin-top: 0.5rem !important; }
-.conf-high { color: #059669; font-weight: 700; }
-.conf-medium { color: #D97706; font-weight: 700; }
-.conf-low { color: #DC2626; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -188,15 +182,10 @@ def get_freshness_status(data_date):
 # ============================================================
 
 def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
-    """
-    Compute a data-quality + signal-reliability score.
-    Returns {'level': 'HIGH'|'MEDIUM'|'LOW', 'score': int, 'reasons': [...]}.
-    """
     score = 0
     reasons = []
 
-    if freshness_status == "FRESH":
-        score += 3
+    if freshness_status == "FRESH": score += 3
     elif freshness_status == "DELAYED":
         score += 1
         reasons.append("Data 2-3 business days old")
@@ -228,20 +217,17 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
             reasons.append(f"R:R {round(rr1,2)} poor")
 
     signal = result.get("signal", {}).get("signal", "")
-    if signal in ("STRONG BUY", "BUY"):
-        score += 2
-    elif signal in ("WAIT",):
-        score += 0
-    elif signal in ("REDUCE",):
+    if signal in ("STRONG BUY", "BUY"): score += 2
+    elif signal == "WAIT": score += 0
+    elif signal == "REDUCE":
         score -= 1
         reasons.append("Signal REDUCE")
-    elif signal in ("AVOID",):
+    elif signal == "AVOID":
         score -= 2
         reasons.append("Signal AVOID")
 
     regime = result.get("market", {}).get("regime", "")
-    if regime == "BULLISH":
-        score += 1
+    if regime == "BULLISH": score += 1
     elif regime == "BEARISH":
         score -= 1
         reasons.append("Market regime bearish")
@@ -249,38 +235,67 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score -= 1
         reasons.append("Market regime high volatility")
 
-    if score >= 7:
-        level = "HIGH"
-    elif score >= 2:
-        level = "MEDIUM"
-    else:
-        level = "LOW"
+    if score >= 7: level = "HIGH"
+    elif score >= 2: level = "MEDIUM"
+    else: level = "LOW"
 
     return {"level": level, "score": score, "reasons": reasons}
 
 # ============================================================
 # PSX OFFICIAL DATA PORTAL
 # ============================================================
+# FIX v8.6: Clean browser UA (no bot suffix) + persistent session
+# with homepage warm-up for cookies. This was likely triggering
+# PSX anti-bot protection.
+# ============================================================
 
 PSX_BASE = "https://dps.psx.com.pk"
+# Clean, pure browser UA — no app suffix. Do NOT add identifiers here.
 PSX_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 PSXQuantEngine/8.5.1 (personal research)")
+    "Chrome/124.0 Safari/537.36")
 
 _LAST_PSX_REQUEST_TS = 0.0
 _PSX_MIN_INTERVAL = 1.0
+_PSX_SESSION: Optional[requests.Session] = None
+
+def _get_psx_session() -> requests.Session:
+    """
+    Lazily create a persistent Session with browser-like headers,
+    and warm it up with a homepage GET to acquire any cookies.
+    """
+    global _PSX_SESSION
+    if _PSX_SESSION is None:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": PSX_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        })
+        try:
+            s.get(PSX_BASE + "/", timeout=10)
+        except Exception:
+            pass
+        _PSX_SESSION = s
+    return _PSX_SESSION
 
 def _psx_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
+    """Rate-limited GET via persistent session."""
     global _LAST_PSX_REQUEST_TS
     elapsed = time.time() - _LAST_PSX_REQUEST_TS
     if elapsed < _PSX_MIN_INTERVAL:
         time.sleep(_PSX_MIN_INTERVAL - elapsed)
     try:
-        resp = requests.get(url, headers={
-            "User-Agent": PSX_USER_AGENT,
-            "Accept": "text/html,application/json,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-        }, timeout=timeout)
+        session = _get_psx_session()
+        resp = session.get(url, timeout=timeout)
         _LAST_PSX_REQUEST_TS = time.time()
         return resp
     except Exception:
@@ -372,10 +387,6 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
 # ============================================================
 
 def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """
-    Returns today's live PSX official price for a ticker.
-    SANITY CHECK: reject if ratio > 10x or < 0.1x vs yfinance reference.
-    """
     try:
         mw, status, _ = fetch_psx_official_market_watch()
         if status != "SUCCESS" or mw is None:
@@ -412,7 +423,6 @@ def get_scan_universe() -> Tuple[List[str], str]:
 # ============================================================
 
 def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
-    """Returns 3-tuple: (df, status, error)."""
     try:
         import psxdata
         symbol = normalize_ticker_display(ticker)
@@ -449,11 +459,7 @@ def fetch_psxdata_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.Da
         return None, "EMPTY", f"psxdata error: {str(e)}"
 
 def fetch_yfinance_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
-    """
-    Try multiple yfinance symbol formats for PSX stocks.
-    PSX naming is inconsistent: some use .KA, some bare, some .PK.
-    Returns 3-tuple: (df, status, error).
-    """
+    """Try multiple yfinance symbol formats. Returns 3-tuple: (df, status, error)."""
     base = ticker.strip().upper().replace(".KA", "").replace(".PK", "")
     if ticker.strip().upper().endswith(".KA"):
         candidates = [ticker.strip().upper(), base, f"{base}.PK"]
@@ -531,7 +537,6 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str, str]:
-    """Returns 4-tuple: (df, status, error, source)."""
     provider_attempts = []
     df, status, error = fetch_psxdata_ohlcv(ticker, period)
     provider_attempts.append(f"psxdata: {status}")
@@ -580,7 +585,7 @@ def fetch_universe() -> Tuple[List[str], str, str]:
     return uni, src, None
 
 # ============================================================
-# RECONCILIATION (date-aware)
+# RECONCILIATION
 # ============================================================
 
 def reconcile_psx_vs_yf(ticker: str, yf_df: pd.DataFrame) -> Dict[str, Any]:
@@ -1546,7 +1551,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.5.1</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.6</div>", unsafe_allow_html=True)
 
 st.sidebar.subheader("🔌 Provider Status")
 psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
@@ -1587,7 +1592,7 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     fetch_psx_official_index_json.clear()
     fetch_psx_official_market_watch.clear()
     get_scan_universe.clear()
-    for k in ["screener_df", "watchlist_df", "next_session_df", "top_picks_df", "proxy_result"]:
+    for k in ["screener_df", "next_session_df", "top_picks_df", "proxy_result"]:
         st.session_state.pop(k, None)
     st.sidebar.success("Cache cleared!")
 
@@ -1599,16 +1604,14 @@ st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
 
 if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = "SYS, OGDC, HBL, LUCK, FFC, ENGRO"
 
 # ============================================================
-# MAIN TABS
+# MAIN TABS (7 tabs — Watchlist removed)
 # ============================================================
 
-tab_dash, tab_screener, tab_breakouts, tab_next, tab_watch, tab_port, tab_market, tab_top = st.tabs([
+tab_dash, tab_screener, tab_breakouts, tab_next, tab_port, tab_market, tab_top = st.tabs([
     "📊 Dashboard", "🔍 Screener", "🚀 Breakouts", "📅 Next Session",
-    "📋 Watchlist", "💼 Portfolio", "📈 Market", "🎯 Top Picks"])
+    "💼 Portfolio", "📈 Market", "🎯 Top Picks"])
 
 # ============================================================
 # DASHBOARD TAB
@@ -1624,10 +1627,6 @@ with tab_dash:
             st.write(f"**Status:** {status}")
             st.write(f"**Error:** {error}")
             st.write(f"**Source:** {source if source else 'N/A'}")
-            st.markdown("**Ye kya matlab hai?**")
-            st.write("- PSX pe symbol listed hai, lekin yfinance pe data available nahi")
-            st.write("- Ye **data source limitation** hai, app bug nahi")
-            st.write("- Screener aur Portfolio is stock ko skip kar dein ge, baaki sab kaam karega")
             st.markdown("**Try:**")
             st.write("1. Refresh Data button dabao (sidebar)")
             st.write("2. Ticker spelling check karo")
@@ -1774,13 +1773,13 @@ with tab_dash:
                 st.caption("N/A — insufficient 52-week history (need ≥252 sessions)")
 
 # ============================================================
-# SCREENER TAB
+# SCREENER TAB — default filter now includes WAIT
 # ============================================================
 
 with tab_screener:
     st.subheader("🔍 PSX Opportunity Scanner")
     universe_option = st.selectbox("Universe",
-        ["Dynamic (PSX official market-watch)", "Liquid PSX (~34)", "Small Cap (~25)", "Custom (from watchlist)"],
+        ["Dynamic (PSX official market-watch)", "Liquid PSX (~34)", "Small Cap (~25)", "Custom"],
         index=0)
     col1, col2 = st.columns(2)
     with col1: custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
@@ -1789,9 +1788,12 @@ with tab_screener:
     st.markdown("**Filters**")
     p1, p2, p3 = st.columns(3)
     with p1:
+        # v8.6 FIX: Default now includes WAIT so bearish market isn't empty
         signal_filter = st.multiselect("Signal",
             ["STRONG BUY", "BUY", "WAIT", "REDUCE", "AVOID"],
-            default=["STRONG BUY", "BUY"])
+            default=["STRONG BUY", "BUY", "WAIT"],
+            help="Bearish market mein sirf BUY filter rakho to screen khaali aayegi. "
+                 "WAIT include karne se underlying candidates dikhte hain.")
     with p2:
         price_range = st.slider("Price Range (PKR)", min_value=0.0, max_value=5000.0,
             value=(0.0, 5000.0), step=10.0)
@@ -1827,10 +1829,13 @@ with tab_screener:
             elif universe_option == "Small Cap (~25)":
                 universe, uni_source = PSX_SMALL_CAP_UNIVERSE, f"Small Cap ({len(PSX_SMALL_CAP_UNIVERSE)})"
             else:
-                universe = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip()
-                           for t in st.session_state.watchlist.split(",") if t.strip()]
-                uni_source = f"Custom watchlist ({len(universe)})"
-            if custom_syms:
+                # Custom: sidebar ticker + extra
+                universe = [normalize_ticker(sidebar_ticker)]
+                if custom_syms:
+                    universe += [normalize_ticker(t) for t in custom_syms.split(",") if t.strip()]
+                universe = list(dict.fromkeys(universe))
+                uni_source = f"Custom ({len(universe)})"
+            if custom_syms and universe_option != "Custom":
                 extra = [t.strip() + ".KA" if not t.strip().endswith(".KA") else t.strip()
                         for t in custom_syms.split(",") if t.strip()]
                 universe = list(dict.fromkeys(universe + extra))
@@ -2020,43 +2025,6 @@ with tab_next:
                 cap_df = pd.DataFrame(rows)
                 st.dataframe(cap_df, use_container_width=True, hide_index=True)
                 st.caption("⚠️ 'Est. Pace' ATR-based rough estimate. Guaranteed timeline nahi.")
-
-# ============================================================
-# WATCHLIST TAB
-# ============================================================
-
-with tab_watch:
-    st.subheader("📋 Watchlist")
-    st.markdown("**Edit Watchlist**")
-    new_watchlist = st.text_area("Tickers (comma-separated)",
-        value=st.session_state.watchlist, key="watchlist_editor",
-        help="Jaise: SYS, OGDC, HBL, LUCK")
-    wl1, wl2 = st.columns([1, 3])
-    with wl1:
-        if st.button("💾 Save & Update", use_container_width=True):
-            st.session_state.watchlist = new_watchlist
-            st.success("Watchlist saved!")
-    with wl2:
-        st.caption(f"Current: {st.session_state.watchlist}")
-    st.divider()
-    tickers = [t.strip() for t in st.session_state.watchlist.split(",") if t.strip()]
-    if st.button("🔄 Refresh Analysis", use_container_width=True):
-        with st.spinner("Analyzing watchlist..."):
-            market = market_snapshot()
-            watchlist_df, _ = run_screener(tickers, period="1y",
-                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
-            st.session_state["watchlist_df"] = watchlist_df
-    if "watchlist_df" in st.session_state:
-        df_w = st.session_state["watchlist_df"]
-        if not df_w.empty:
-            cols = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
-                    "Confidence", "Gate", "Status", "RR", "RR Flag", "Cap Size", "Source", "Why"]
-            cols = [c for c in cols if c in df_w.columns]
-            st.dataframe(df_w[cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("Watchlist empty ya koi data nahi mila")
-    else:
-        st.info("Click 'Refresh Analysis' to analyze")
 
 # ============================================================
 # PORTFOLIO TAB
