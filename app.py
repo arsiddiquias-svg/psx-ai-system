@@ -1,18 +1,16 @@
 """
-PSX QUANT ENGINE - v8.6
+PSX QUANT ENGINE - v8.7
 ========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.6:
-- FIX: PSX User-Agent cleaned (no bot-suffix). Was likely triggering
-       PSX anti-bot protection.
-- FIX: PSX requests now use persistent Session with homepage warm-up
-       (get cookies first, then hit API).
-- FIX: Screener default filter now includes "WAIT" so bearish market
-       doesn't show empty result.
-- REMOVE: Watchlist tab (unused).
-- PRESERVE: All v8.5.1 features — confidence, live PSX price override,
-            alternate yfinance suffix, all fixes from v7.x.
+CHANGELOG v8.7:
+- PRIORITY 1: Raw PSX diagnostic capture. Ab Provider Status mein poora
+  error message visible hoga (timeout vs 403 vs 200+empty), guess nahi.
+  Plus standalone diagnostic button.
+- PRIORITY 2: Top Picks + Breakouts mein Entry/Stop Loss/Target 1
+  columns add (RR ke paas).
+- PRIORITY 3: Next Session tab remove (Screener ka duplicate tha).
+- PRESERVE: All v8.6 features (session UA fix, confidence, live price).
 
 DEPLOYMENT:
 - Python 3.11 or 3.12 recommended
@@ -35,7 +33,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.6",
+    page_title="PSX Quant Engine v8.7",
     page_icon="📈",
     layout="wide"
 )
@@ -94,6 +92,7 @@ KSE100_CANDIDATES = ["^KSE100", "KSE100.KA"]
 
 SCREENER_COLUMNS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score",
                     "Signal", "Gate", "Confidence", "Status", "Penny", "RR", "RR Flag",
+                    "Entry", "Stop Loss", "Target 1",
                     "Cap Size", "Source", "Why", "Avg Volume", "_ticker_raw"]
 
 # ============================================================
@@ -121,20 +120,29 @@ PSX_FALLBACK_UNIVERSE = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_U
 # ============================================================
 # PROVIDER STATUS
 # ============================================================
+# v8.7: Added "diagnostic" field to capture raw PSX error details.
 
 PROVIDER_STATUS = {
-    "psx_official": {"available": False, "last_success": None, "error": None, "coverage": 0, "kse100": False, "last_fetch_attempt": None},
-    "psxdata":      {"available": False, "last_success": None, "error": None, "coverage": 0, "kse100": False, "last_fetch_attempt": None},
-    "yfinance":     {"available": True,  "last_success": None, "error": None, "coverage": 0, "kse100": False, "last_fetch_attempt": None},
+    "psx_official": {"available": False, "last_success": None, "error": None,
+                     "diagnostic": None, "coverage": 0, "kse100": False,
+                     "last_fetch_attempt": None},
+    "psxdata":      {"available": False, "last_success": None, "error": None,
+                     "diagnostic": None, "coverage": 0, "kse100": False,
+                     "last_fetch_attempt": None},
+    "yfinance":     {"available": True,  "last_success": None, "error": None,
+                     "diagnostic": None, "coverage": 0, "kse100": False,
+                     "last_fetch_attempt": None},
 }
 
 def update_provider_status(provider: str, available: bool = None, error: str = None,
-                           coverage: int = None, kse100: bool = None):
+                           coverage: int = None, kse100: bool = None,
+                           diagnostic: str = None):
     if provider in PROVIDER_STATUS:
         if available is not None: PROVIDER_STATUS[provider]["available"] = available
         if error is not None: PROVIDER_STATUS[provider]["error"] = error
         if coverage is not None: PROVIDER_STATUS[provider]["coverage"] = coverage
         if kse100 is not None: PROVIDER_STATUS[provider]["kse100"] = kse100
+        if diagnostic is not None: PROVIDER_STATUS[provider]["diagnostic"] = diagnostic
         if available: PROVIDER_STATUS[provider]["last_success"] = pkt_now()
         PROVIDER_STATUS[provider]["last_fetch_attempt"] = pkt_now()
 
@@ -184,73 +192,51 @@ def get_freshness_status(data_date):
 def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
     score = 0
     reasons = []
-
     if freshness_status == "FRESH": score += 3
     elif freshness_status == "DELAYED":
-        score += 1
-        reasons.append("Data 2-3 business days old")
+        score += 1; reasons.append("Data 2-3 business days old")
     else:
-        score -= 3
-        reasons.append("Data STALE (>3 business days old)")
-
+        score -= 3; reasons.append("Data STALE (>3 business days old)")
     if result.get("display_price_source") == "psx_official_live":
         score += 2
     else:
         reasons.append("PSX live price unavailable (using yfinance close)")
-
     trend = result.get("trend", "")
-    if trend in ("BULLISH", "STRONG BULLISH"):
-        score += 2
+    if trend in ("BULLISH", "STRONG BULLISH"): score += 2
     elif trend in ("BEARISH", "STRONG BEARISH"):
-        score -= 3
-        reasons.append(f"Bearish trend ({trend}) — long entries risky")
-
+        score -= 3; reasons.append(f"Bearish trend ({trend})")
     rr1 = result.get("risk", {}).get("rr1")
     if rr1 is not None:
         if rr1 >= 2.0: score += 2
         elif rr1 >= MIN_RR: score += 1
         elif rr1 >= 1.0:
-            score -= 1
-            reasons.append(f"R:R {round(rr1,2)} below preferred minimum")
+            score -= 1; reasons.append(f"R:R {round(rr1,2)} below minimum")
         else:
-            score -= 2
-            reasons.append(f"R:R {round(rr1,2)} poor")
-
+            score -= 2; reasons.append(f"R:R {round(rr1,2)} poor")
     signal = result.get("signal", {}).get("signal", "")
     if signal in ("STRONG BUY", "BUY"): score += 2
-    elif signal == "WAIT": score += 0
     elif signal == "REDUCE":
-        score -= 1
-        reasons.append("Signal REDUCE")
+        score -= 1; reasons.append("Signal REDUCE")
     elif signal == "AVOID":
-        score -= 2
-        reasons.append("Signal AVOID")
-
+        score -= 2; reasons.append("Signal AVOID")
     regime = result.get("market", {}).get("regime", "")
     if regime == "BULLISH": score += 1
     elif regime == "BEARISH":
-        score -= 1
-        reasons.append("Market regime bearish")
+        score -= 1; reasons.append("Market regime bearish")
     elif regime == "HIGH VOLATILITY":
-        score -= 1
-        reasons.append("Market regime high volatility")
-
+        score -= 1; reasons.append("Market regime high volatility")
     if score >= 7: level = "HIGH"
     elif score >= 2: level = "MEDIUM"
     else: level = "LOW"
-
     return {"level": level, "score": score, "reasons": reasons}
 
 # ============================================================
 # PSX OFFICIAL DATA PORTAL
 # ============================================================
-# FIX v8.6: Clean browser UA (no bot suffix) + persistent session
-# with homepage warm-up for cookies. This was likely triggering
-# PSX anti-bot protection.
+# v8.7: Raw diagnostic capture on failure.
 # ============================================================
 
 PSX_BASE = "https://dps.psx.com.pk"
-# Clean, pure browser UA — no app suffix. Do NOT add identifiers here.
 PSX_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36")
@@ -260,10 +246,6 @@ _PSX_MIN_INTERVAL = 1.0
 _PSX_SESSION: Optional[requests.Session] = None
 
 def _get_psx_session() -> requests.Session:
-    """
-    Lazily create a persistent Session with browser-like headers,
-    and warm it up with a homepage GET to acquire any cookies.
-    """
     global _PSX_SESSION
     if _PSX_SESSION is None:
         s = requests.Session()
@@ -288,7 +270,6 @@ def _get_psx_session() -> requests.Session:
     return _PSX_SESSION
 
 def _psx_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
-    """Rate-limited GET via persistent session."""
     global _LAST_PSX_REQUEST_TS
     elapsed = time.time() - _LAST_PSX_REQUEST_TS
     if elapsed < _PSX_MIN_INTERVAL:
@@ -302,13 +283,85 @@ def _psx_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
         _LAST_PSX_REQUEST_TS = time.time()
         return None
 
+def diagnostic_psx_probe() -> str:
+    """
+    Standalone probe: hits PSX homepage + KSE-100 endpoint, reports raw
+    network behavior. Called from UI diagnostic button.
+    """
+    lines = []
+    lines.append(f"**Timestamp:** {pkt_now().strftime('%Y-%m-%d %H:%M:%S PKT')}")
+    lines.append(f"**User-Agent:** `{PSX_USER_AGENT}`")
+    lines.append("")
+    # Probe 1: homepage
+    lines.append("### Probe 1: Homepage (`https://dps.psx.com.pk/`)")
+    try:
+        session = _get_psx_session()
+        r = session.get(PSX_BASE + "/", timeout=10)
+        lines.append(f"- HTTP status: `{r.status_code}`")
+        lines.append(f"- Content length: `{len(r.text)}` bytes")
+        lines.append(f"- Server: `{r.headers.get('Server', 'n/a')}`")
+        lines.append(f"- Content-Type: `{r.headers.get('Content-Type', 'n/a')}`")
+    except Exception as e:
+        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
+    lines.append("")
+    # Probe 2: KSE-100 EOD
+    lines.append("### Probe 2: KSE-100 EOD (`/timeseries/eod/KSE100`)")
+    try:
+        r = _psx_get(f"{PSX_BASE}/timeseries/eod/KSE100", timeout=15)
+        if r is None:
+            lines.append("- ❌ No response at all (timeout / DNS / connection refused)")
+            lines.append("- **Likely cause:** IP-level block from PSX. Streamlit Cloud "
+                         "egress IPs may be blocked. Fix requires Pakistan-based hosting "
+                         "or a proxy — code-level fix won't help.")
+        else:
+            lines.append(f"- HTTP status: `{r.status_code}`")
+            lines.append(f"- Content length: `{len(r.text)}` bytes")
+            lines.append(f"- Content-Type: `{r.headers.get('Content-Type', 'n/a')}`")
+            if r.status_code in (403, 429):
+                lines.append(f"- **Likely cause:** Bot detection / rate limit. "
+                             f"Headers or proxy may help.")
+            elif r.status_code == 200:
+                body_preview = r.text[:200].replace("\n", " ")
+                lines.append(f"- Body preview: `{body_preview}`")
+                if len(r.text) < 50:
+                    lines.append("- **Likely cause:** Endpoint returned empty. "
+                                 "URL may have changed.")
+            else:
+                lines.append(f"- **HTTP {r.status_code}** — unexpected. Inspect body.")
+    except Exception as e:
+        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
+    lines.append("")
+    # Probe 3: Market watch
+    lines.append("### Probe 3: Market Watch (`/market-watch`)")
+    try:
+        r = _psx_get(f"{PSX_BASE}/market-watch", timeout=15)
+        if r is None:
+            lines.append("- ❌ No response at all (timeout / DNS / connection refused)")
+        else:
+            lines.append(f"- HTTP status: `{r.status_code}`")
+            lines.append(f"- Content length: `{len(r.text)}` bytes")
+            if r.status_code == 200:
+                body_preview = r.text[:200].replace("\n", " ")
+                lines.append(f"- Body preview: `{body_preview}`")
+    except Exception as e:
+        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
+    return "\n".join(lines)
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optional[pd.DataFrame], str, str]:
     url = f"{PSX_BASE}/timeseries/eod/{index_symbol}"
     try:
         resp = _psx_get(url)
-        if resp is None or resp.status_code != 200:
-            return None, "EMPTY", f"HTTP {resp.status_code if resp else 'no-response'}"
+        if resp is None:
+            msg = "Connection failed entirely (timeout/DNS/network — possibly IP blocked)"
+            update_provider_status("psx_official", available=False, error=msg,
+                                   diagnostic=f"No response from {url}")
+            return None, "EMPTY", msg
+        if resp.status_code != 200:
+            msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            update_provider_status("psx_official", available=False, error=msg,
+                                   diagnostic=f"Status {resp.status_code} on {url}")
+            return None, "EMPTY", msg
         data = resp.json()
         if isinstance(data, dict): data = data.get("data", [])
         rows = []
@@ -328,7 +381,10 @@ def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optiona
                 except Exception:
                     continue
         if not rows:
-            return None, "EMPTY", "EOD JSON mein koi parseable row nahi"
+            msg = f"HTTP 200 but no parseable rows ({len(data) if isinstance(data, list) else 'non-list'} items)"
+            update_provider_status("psx_official", available=False, error=msg,
+                                   diagnostic=f"Response shape unexpected")
+            return None, "EMPTY", msg
         df = pd.DataFrame(rows).set_index("Date").sort_index()
         df = df[~df.index.duplicated(keep="last")]
         df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
@@ -339,21 +395,32 @@ def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optiona
             median_gap = df.index.to_series().diff().dt.total_seconds().median()
             if pd.notna(median_gap) and median_gap < 3600:
                 return None, "EXCEPTION", f"Intraday lag raha hai (gap {median_gap:.0f}s)"
-        update_provider_status("psx_official", available=True, coverage=len(df), kse100=(index_symbol == "KSE100"))
+        update_provider_status("psx_official", available=True, coverage=len(df),
+                               kse100=(index_symbol == "KSE100"), diagnostic=None)
         return df, "SUCCESS", None
     except Exception as e:
-        update_provider_status("psx_official", available=False, error=str(e)[:120])
-        return None, "EXCEPTION", f"PSX EOD error: {str(e)[:120]}"
+        msg = f"{type(e).__name__}: {str(e)[:150]}"
+        update_provider_status("psx_official", available=False, error=msg,
+                               diagnostic="Exception during parse")
+        return None, "EXCEPTION", f"PSX EOD error: {msg}"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]:
     url = f"{PSX_BASE}/market-watch"
     try:
         resp = _psx_get(url)
-        if resp is None or resp.status_code != 200:
-            return None, "EMPTY", f"HTTP {resp.status_code if resp else 'no-response'}"
+        if resp is None:
+            msg = "Connection failed entirely (timeout/DNS/network — possibly IP blocked)"
+            update_provider_status("psx_official", available=False, error=msg)
+            return None, "EMPTY", msg
+        if resp.status_code != 200:
+            msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            update_provider_status("psx_official", available=False, error=msg)
+            return None, "EMPTY", msg
         tables = pd.read_html(StringIO(resp.text))
-        if not tables: return None, "EMPTY", "HTML mein koi table nahi"
+        if not tables:
+            msg = "HTTP 200 but no tables parsed from HTML"
+            return None, "EMPTY", msg
         df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
         rename_map = {}
         for c in df.columns:
@@ -371,16 +438,18 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
             elif "volume" in cl:               rename_map[c] = "Volume"
         df = df.rename(columns=rename_map)
         if "Symbol" not in df.columns or "Current" not in df.columns:
-            return None, "EXCEPTION", f"Columns missing: {list(df.columns)[:8]}"
+            msg = f"Columns missing: {list(df.columns)[:8]}"
+            return None, "EXCEPTION", msg
         for col in ["LDCP", "Open", "High", "Low", "Current", "Change", "Change_Pct", "Volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "").str.replace("%", "").str.strip(), errors="coerce")
         df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
         df = df[df["Symbol"].str.len() > 0].dropna(subset=["Current"])
-        update_provider_status("psx_official", available=True, coverage=len(df))
+        update_provider_status("psx_official", available=True, coverage=len(df), diagnostic=None)
         return df, "SUCCESS", None
     except Exception as e:
-        return None, "EXCEPTION", f"Market-watch error: {str(e)[:120]}"
+        msg = f"Market-watch error: {str(e)[:150]}"
+        return None, "EXCEPTION", msg
 
 # ============================================================
 # LIVE PSX PRICE
@@ -1198,6 +1267,7 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Change %": None, "Trend": None, "Score": None,
                 "Signal": "ERROR", "Gate": "n/a", "Confidence": "N/A",
                 "Status": "DATA UNAVAILABLE", "Penny": None, "RR": None, "RR Flag": "",
+                "Entry": None, "Stop Loss": None, "Target 1": None,
                 "Cap Size": None, "Source": source, "Why": "Data unavailable",
                 "Avg Volume": None, "_ticker_raw": ticker})
             continue
@@ -1240,6 +1310,9 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Penny": result["penny"]["status"] if result["penny"]["is_penny"] else "N/A",
                 "RR": round(rr_val, 2) if rr_val else None,
                 "RR Flag": rr_badge,
+                "Entry": round(result["risk"]["entry"], 2) if result["risk"].get("entry") else None,
+                "Stop Loss": round(result["risk"]["stop_loss"], 2) if result["risk"].get("stop_loss") else None,
+                "Target 1": round(result["risk"]["target1"], 2) if result["risk"].get("target1") else None,
                 "Cap Size": result["cap_size"], "Source": result["data_source"],
                 "Why": why_text, "Avg Volume": round(avg_volume, 0),
                 "_ticker_raw": ticker,
@@ -1249,7 +1322,9 @@ def run_screener(universe: List[str], period: str = "1y",
             rows.append({"Ticker": ticker, "Price": None, "Price Src": "N/A",
                 "Change %": None, "Trend": None, "Score": None,
                 "Signal": "ERROR", "Gate": "n/a", "Confidence": "N/A",
-                "Status": f"POST-PROCESS ERROR: {str(e)[:60]}", "Penny": None, "RR": None, "RR Flag": "",
+                "Status": f"POST-PROCESS ERROR: {str(e)[:60]}", "Penny": None,
+                "RR": None, "RR Flag": "",
+                "Entry": None, "Stop Loss": None, "Target 1": None,
                 "Cap Size": None, "Source": source, "Why": "Post-processing error",
                 "Avg Volume": None, "_ticker_raw": ticker})
     if not rows:
@@ -1551,7 +1626,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.6</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.7</div>", unsafe_allow_html=True)
 
 st.sidebar.subheader("🔌 Provider Status")
 psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
@@ -1559,17 +1634,33 @@ if psx_avail:
     kse100_ok = "✅ verified" if PROVIDER_STATUS["psx_official"].get("kse100") else "⚠️ unverified"
     st.sidebar.success(f"✅ PSX Official: Working ({kse100_ok})")
 else:
-    st.sidebar.warning("⚠️ PSX Official: Not available")
+    st.sidebar.error("❌ PSX Official: NOT WORKING")
+    psx_err = PROVIDER_STATUS.get("psx_official", {}).get("error")
+    if psx_err:
+        st.sidebar.caption(f"**Error:** {psx_err[:250]}")
 yf_avail = PROVIDER_STATUS.get("yfinance", {}).get("available", True)
 if yf_avail:
     st.sidebar.success("✅ yfinance: Working (fallback)")
 else:
     st.sidebar.error("❌ yfinance: Failed")
+    yf_err = PROVIDER_STATUS.get("yfinance", {}).get("error")
+    if yf_err:
+        st.sidebar.caption(f"**Error:** {yf_err[:250]}")
 psxd_avail = PROVIDER_STATUS.get("psxdata", {}).get("available", False)
 if psxd_avail:
     st.sidebar.info("ℹ️ psxdata: Working (experimental)")
 else:
     st.sidebar.caption("psxdata: Not installed (optional)")
+
+# v8.7 NEW: PSX Diagnostic button
+with st.sidebar.expander("🩺 PSX Diagnostic Probe"):
+    st.caption("PSX ki raw response check karo — timeout vs 403 vs 200+empty")
+    if st.button("🔍 Run PSX Diagnostic", use_container_width=True, key="psx_diag_btn"):
+        with st.spinner("Probing PSX endpoints..."):
+            diag_text = diagnostic_psx_probe()
+            st.session_state["psx_diag_result"] = diag_text
+    if "psx_diag_result" in st.session_state:
+        st.markdown(st.session_state["psx_diag_result"])
 
 st.sidebar.divider()
 st.sidebar.header("📈 Analysis")
@@ -1592,7 +1683,7 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     fetch_psx_official_index_json.clear()
     fetch_psx_official_market_watch.clear()
     get_scan_universe.clear()
-    for k in ["screener_df", "next_session_df", "top_picks_df", "proxy_result"]:
+    for k in ["screener_df", "top_picks_df", "proxy_result", "psx_diag_result"]:
         st.session_state.pop(k, None)
     st.sidebar.success("Cache cleared!")
 
@@ -1606,11 +1697,11 @@ if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
 
 # ============================================================
-# MAIN TABS (7 tabs — Watchlist removed)
+# MAIN TABS (6 tabs — Watchlist + Next Session removed)
 # ============================================================
 
-tab_dash, tab_screener, tab_breakouts, tab_next, tab_port, tab_market, tab_top = st.tabs([
-    "📊 Dashboard", "🔍 Screener", "🚀 Breakouts", "📅 Next Session",
+tab_dash, tab_screener, tab_breakouts, tab_port, tab_market, tab_top = st.tabs([
+    "📊 Dashboard", "🔍 Screener", "🚀 Breakouts",
     "💼 Portfolio", "📈 Market", "🎯 Top Picks"])
 
 # ============================================================
@@ -1630,7 +1721,7 @@ with tab_dash:
             st.markdown("**Try:**")
             st.write("1. Refresh Data button dabao (sidebar)")
             st.write("2. Ticker spelling check karo")
-            st.write("3. Kuch PSX symbols yfinance pe poori tarah missing hain")
+            st.write("3. PSX Diagnostic probe chalao (sidebar mein)")
     else:
         last = result["last"]; sig = result["signal"]
         trend = result["trend"]
@@ -1773,7 +1864,7 @@ with tab_dash:
                 st.caption("N/A — insufficient 52-week history (need ≥252 sessions)")
 
 # ============================================================
-# SCREENER TAB — default filter now includes WAIT
+# SCREENER TAB
 # ============================================================
 
 with tab_screener:
@@ -1788,7 +1879,6 @@ with tab_screener:
     st.markdown("**Filters**")
     p1, p2, p3 = st.columns(3)
     with p1:
-        # v8.6 FIX: Default now includes WAIT so bearish market isn't empty
         signal_filter = st.multiselect("Signal",
             ["STRONG BUY", "BUY", "WAIT", "REDUCE", "AVOID"],
             default=["STRONG BUY", "BUY", "WAIT"],
@@ -1829,7 +1919,6 @@ with tab_screener:
             elif universe_option == "Small Cap (~25)":
                 universe, uni_source = PSX_SMALL_CAP_UNIVERSE, f"Small Cap ({len(PSX_SMALL_CAP_UNIVERSE)})"
             else:
-                # Custom: sidebar ticker + extra
                 universe = [normalize_ticker(sidebar_ticker)]
                 if custom_syms:
                     universe += [normalize_ticker(t) for t in custom_syms.split(",") if t.strip()]
@@ -1854,7 +1943,8 @@ with tab_screener:
             st.session_state["screener_coverage"] = coverage
             st.session_state["screener_universe_source"] = uni_source
         if not screener_df.empty:
-            missing = [c for c in ["RR", "Score", "Signal", "Price", "Status", "Confidence"]
+            missing = [c for c in ["RR", "Score", "Signal", "Price", "Status", "Confidence",
+                                   "Entry", "Stop Loss", "Target 1"]
                        if c not in screener_df.columns]
             if missing:
                 st.warning(f"⚠️ Screener output mein ye columns missing hain: {missing}")
@@ -1912,7 +2002,7 @@ with tab_screener:
             + (f" ({penny_count} penny stocks)" if include_penny and penny_count > 0 else ""))
         st.caption("ℹ️ **Confidence** = data quality + signal reliability. "
                    "**Gate** = why signal became WAIT/REDUCE. "
-                   "**RR Flag** = low reward:risk warning.")
+                   "**Entry/Stop/Target** = actionable levels.")
         if not view.empty:
             display_cols = [c for c in view.columns if not c.startswith("_")]
             st.dataframe(view[display_cols], use_container_width=True, hide_index=True)
@@ -1920,7 +2010,7 @@ with tab_screener:
             st.info("No stocks match filters")
 
 # ============================================================
-# BREAKOUTS TAB
+# BREAKOUTS TAB (with Entry/Stop/Target)
 # ============================================================
 
 with tab_breakouts:
@@ -1958,8 +2048,12 @@ with tab_breakouts:
                             "Resistance": round(result["breakout"]["resistance"], 2),
                             "Dist %": round(result["breakout"]["distance_to_resistance"], 2)
                                         if result["breakout"]["distance_to_resistance"] is not None else "N/A",
-                            "Momentum": result["momentum"]["label"], "RR": row["RR"],
+                            "Entry": row.get("Entry"),
+                            "Stop Loss": row.get("Stop Loss"),
+                            "Target 1": row.get("Target 1"),
+                            "RR": row["RR"],
                             "RR Flag": row.get("RR Flag", ""),
+                            "Momentum": result["momentum"]["label"],
                             "52W": "🚀 BREAKOUT" if result["breakout"]["is_52w_high_breakout"]
                                    else "🔵 NEAR" if result["breakout"]["is_near_52w_high"] else "-",
                             "Why": row["Why"]})
@@ -1968,63 +2062,6 @@ with tab_breakouts:
                     st.dataframe(bo_df, use_container_width=True, hide_index=True)
                 else:
                     st.info("Koi detailed breakout data available nahi.")
-
-# ============================================================
-# NEXT SESSION TAB
-# ============================================================
-
-with tab_next:
-    st.subheader("📅 Next Session Watchlist")
-    st.caption("Next session ke top candidates — manual scan on demand")
-    if st.button("🔄 Refresh Next Session", use_container_width=True):
-        with st.spinner("Scanning candidates..."):
-            combined, uni_source = get_scan_universe()
-            st.caption(f"Universe: {uni_source}")
-            if len(combined) > 100:
-                st.caption(f"📊 Scanning first 100 of {len(combined)} for speed.")
-                combined = combined[:100]
-            market = market_snapshot()
-            st.session_state["next_session_df"], _ = run_screener(
-                combined, period="1y", penny_threshold=penny_threshold,
-                rvol_threshold=rvol_threshold, market=market)
-    if "next_session_df" not in st.session_state:
-        st.info("Click **Refresh Next Session** to scan candidates.")
-    else:
-        df_s = st.session_state["next_session_df"]
-        if df_s.empty or "Signal" not in df_s.columns:
-            st.info("Koi data nahi mila — dobara try karo.")
-        else:
-            top = df_s[df_s["Signal"].isin(["STRONG BUY", "BUY"])].dropna(subset=["Score"])
-            top = top.sort_values("Score", ascending=False).head(10)
-            if top.empty:
-                st.info("Koi strong BUY candidate nahi mila.")
-            else:
-                rows = []
-                market = market_snapshot()
-                for _, row in top.iterrows():
-                    ticker_raw = row.get("_ticker_raw", row["Ticker"])
-                    if row["Score"] >= 75 and row["Trend"] in ("BULLISH", "STRONG BULLISH"): sq = "HIGH"
-                    elif row["Score"] >= 60: sq = "MEDIUM"
-                    else: sq = "LOW"
-                    try:
-                        result, status, _, _ = analyze_stock(ticker_raw, period="1y",
-                            penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
-                    except Exception:
-                        result, status = None, "EXCEPTION"
-                    if status == "SUCCESS" and result is not None:
-                        trade_type, pace = estimate_pace_to_target(result)
-                        fresh, _, _ = get_freshness_status(result["data_date"])
-                    else:
-                        trade_type, pace, fresh = "N/A", "N/A", "UNAVAILABLE"
-                    rows.append({"Ticker": row["Ticker"], "Price": row["Price"],
-                        "Price Src": row.get("Price Src", "📅 yf"),
-                        "Trend": row["Trend"], "Score": row["Score"], "Signal": row["Signal"],
-                        "Confidence": row.get("Confidence", "N/A"),
-                        "Status": row["Status"], "RR": row["RR"], "Trade Type": trade_type,
-                        "Est. Pace": pace, "Setup Quality": sq, "Data": fresh, "Why": row["Why"]})
-                cap_df = pd.DataFrame(rows)
-                st.dataframe(cap_df, use_container_width=True, hide_index=True)
-                st.caption("⚠️ 'Est. Pace' ATR-based rough estimate. Guaranteed timeline nahi.")
 
 # ============================================================
 # PORTFOLIO TAB
@@ -2151,7 +2188,11 @@ with tab_market:
     if market["regime"] == "UNAVAILABLE":
         st.warning("🔴 KSE-100: DATA UNAVAILABLE")
         st.caption(f"Source: {market['source']}")
-        st.caption("Koi provider se KSE-100 data nahi mila.")
+        psx_err = PROVIDER_STATUS.get("psx_official", {}).get("error")
+        if psx_err:
+            st.error(f"**PSX error:** {psx_err}")
+            st.caption("Sidebar mein 'PSX Diagnostic Probe' chalao — exact cause batayega "
+                       "(timeout / 403 / 200+empty).")
     else:
         fresh, _, fresh_warn = get_freshness_status(market["last_date"])
         c1, c2, c3 = st.columns(3)
@@ -2206,13 +2247,13 @@ with tab_market:
             "Coverage": v["coverage"], "KSE-100": "✅" if v["kse100"] else "❌",
             "Last Success": v["last_success"].strftime("%d-%b %H:%M") if v["last_success"] else "Never",
             "Last Attempt": v["last_fetch_attempt"].strftime("%d-%b %H:%M") if v["last_fetch_attempt"] else "Never",
-            "Error": (v["error"][:80] if v["error"] else "-")}
+            "Error": (v["error"][:100] if v["error"] else "-")}
             for k, v in PROVIDER_STATUS.items()])
         st.dataframe(diag, use_container_width=True, hide_index=True)
         st.caption("⚠️ Diagnostics = actual network fetches only.")
 
 # ============================================================
-# TOP PICKS TAB
+# TOP PICKS TAB (Day/Swing/Hold with Entry/Stop/Target)
 # ============================================================
 
 with tab_top:
@@ -2261,8 +2302,9 @@ with tab_top:
                 st.info("Koi day-trade candidate nahi mila.")
             else:
                 day_cols = ["Ticker", "Price", "Price Src", "Change %", "Score", "Signal",
-                            "Gate", "Confidence", "Status", "RR", "RR Flag",
-                            "Hold Estimate", "Basis"]
+                            "Gate", "Confidence", "Status",
+                            "Entry", "Stop Loss", "Target 1",
+                            "RR", "RR Flag", "Hold Estimate", "Basis"]
                 day_cols = [c for c in day_cols if c in picks["day"].columns]
                 st.dataframe(picks["day"][day_cols], use_container_width=True, hide_index=True)
             st.divider()
@@ -2272,7 +2314,9 @@ with tab_top:
                 st.info("Koi swing-trade candidate nahi mila.")
             else:
                 swing_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
-                              "Gate", "Confidence", "Status", "RR", "Hold Estimate", "Basis"]
+                              "Gate", "Confidence", "Status",
+                              "Entry", "Stop Loss", "Target 1",
+                              "RR", "Hold Estimate", "Basis"]
                 swing_cols = [c for c in swing_cols if c in picks["swing"].columns]
                 st.dataframe(picks["swing"][swing_cols], use_container_width=True, hide_index=True)
             st.divider()
@@ -2282,10 +2326,13 @@ with tab_top:
                 st.info("Koi hold candidate nahi mila.")
             else:
                 hold_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
-                             "Gate", "Confidence", "Status", "RR", "Hold Estimate", "Basis"]
+                             "Gate", "Confidence", "Status",
+                             "Entry", "Stop Loss", "Target 1",
+                             "RR", "Hold Estimate", "Basis"]
                 hold_cols = [c for c in hold_cols if c in picks["hold"].columns]
                 st.dataframe(picks["hold"][hold_cols], use_container_width=True, hide_index=True)
-            st.caption("**Hold Estimate** = ATR-based pace calculation. Technical estimate, guaranteed nahi.")
+            st.caption("**Hold Estimate** = ATR-based pace calculation. Technical estimate, guaranteed nahi. "
+                       "**Entry/Stop/Target 1** = long trade plan levels (skip if bearish).")
 
 # ============================================================
 # FOOTER
