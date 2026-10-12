@@ -1,16 +1,21 @@
 """
-PSX QUANT ENGINE - v8.7
+PSX QUANT ENGINE - v8.8
 ========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.7:
-- PRIORITY 1: Raw PSX diagnostic capture. Ab Provider Status mein poora
-  error message visible hoga (timeout vs 403 vs 200+empty), guess nahi.
-  Plus standalone diagnostic button.
-- PRIORITY 2: Top Picks + Breakouts mein Entry/Stop Loss/Target 1
-  columns add (RR ke paas).
-- PRIORITY 3: Next Session tab remove (Screener ka duplicate tha).
-- PRESERVE: All v8.6 features (session UA fix, confidence, live price).
+CHANGELOG v8.8:
+- PSX HEADERS: API calls now send XHR-style headers (Accept: json, Referer,
+  X-Requested-With, Sec-Fetch-Mode cors/same-origin) instead of looking like
+  a page navigation. Removed "br" from Accept-Encoding (requests cannot decode
+  brotli without an extra package -> garbled body). One retry on failure.
+- BREAKOUTS tab is now distinct: pure filter over Screener results (no
+  re-analysis), confirmed / 52W breakouts or near-breakout with RVOL >= X.
+- NEW PULLBACKS tab: bullish-trend stocks pulling back to support / EMA20
+  (swing entries) with Entry / Stop / Target.
+- CHART: volume sub-panel (with 20-day volume average) added.
+- Screener rows now carry RVOL, Pullback, Momentum, Resistance, Dist %, 52W.
+- PRESERVE: everything from v8.7 (diagnostic probe, Entry/Stop/Target,
+  Confidence, live PSX price override, Gate, RR Flag, Portfolio freshness).
 
 DEPLOYMENT:
 - Python 3.11 or 3.12 recommended
@@ -33,7 +38,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.7",
+    page_title="PSX Quant Engine v8.8",
     page_icon="📈",
     layout="wide"
 )
@@ -93,7 +98,9 @@ KSE100_CANDIDATES = ["^KSE100", "KSE100.KA"]
 SCREENER_COLUMNS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score",
                     "Signal", "Gate", "Confidence", "Status", "Penny", "RR", "RR Flag",
                     "Entry", "Stop Loss", "Target 1",
-                    "Cap Size", "Source", "Why", "Avg Volume", "_ticker_raw"]
+                    "Cap Size", "Source", "Why", "Avg Volume",
+                    "RVOL", "Pullback", "Momentum", "Resistance", "Dist %", "52W",
+                    "_ticker_raw"]
 
 # ============================================================
 # PSX UNIVERSE (Fallback only)
@@ -254,7 +261,8 @@ def _get_psx_session() -> requests.Session:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
                       "image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            # NOTE: no "br" - requests cannot decode brotli without extra package
+            "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
@@ -269,19 +277,42 @@ def _get_psx_session() -> requests.Session:
         _PSX_SESSION = s
     return _PSX_SESSION
 
-def _psx_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
+def _psx_request_headers(api: bool) -> Dict[str, Optional[str]]:
+    """Per-request headers. API (XHR/JSON) calls must not look like navigations.
+    A value of None removes the session default for that request."""
+    if api:
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": PSX_BASE + "/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": None,
+            "Upgrade-Insecure-Requests": None,
+        }
+    return {"Referer": PSX_BASE + "/", "Sec-Fetch-Site": "same-origin"}
+
+def _psx_get(url: str, timeout: int = 15, api: bool = False,
+             retries: int = 1) -> Optional[requests.Response]:
     global _LAST_PSX_REQUEST_TS
-    elapsed = time.time() - _LAST_PSX_REQUEST_TS
-    if elapsed < _PSX_MIN_INTERVAL:
-        time.sleep(_PSX_MIN_INTERVAL - elapsed)
-    try:
-        session = _get_psx_session()
-        resp = session.get(url, timeout=timeout)
-        _LAST_PSX_REQUEST_TS = time.time()
-        return resp
-    except Exception:
-        _LAST_PSX_REQUEST_TS = time.time()
-        return None
+    resp = None
+    for attempt in range(retries + 1):
+        elapsed = time.time() - _LAST_PSX_REQUEST_TS
+        if elapsed < _PSX_MIN_INTERVAL:
+            time.sleep(_PSX_MIN_INTERVAL - elapsed)
+        try:
+            session = _get_psx_session()
+            resp = session.get(url, timeout=timeout, headers=_psx_request_headers(api))
+            _LAST_PSX_REQUEST_TS = time.time()
+            if resp.status_code < 500:
+                return resp
+        except Exception:
+            _LAST_PSX_REQUEST_TS = time.time()
+            resp = None
+        if attempt < retries:
+            time.sleep(2.0)
+    return resp
 
 def diagnostic_psx_probe() -> str:
     """
@@ -307,7 +338,7 @@ def diagnostic_psx_probe() -> str:
     # Probe 2: KSE-100 EOD
     lines.append("### Probe 2: KSE-100 EOD (`/timeseries/eod/KSE100`)")
     try:
-        r = _psx_get(f"{PSX_BASE}/timeseries/eod/KSE100", timeout=15)
+        r = _psx_get(f"{PSX_BASE}/timeseries/eod/KSE100", timeout=15, api=True)
         if r is None:
             lines.append("- ❌ No response at all (timeout / DNS / connection refused)")
             lines.append("- **Likely cause:** IP-level block from PSX. Streamlit Cloud "
@@ -351,7 +382,7 @@ def diagnostic_psx_probe() -> str:
 def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optional[pd.DataFrame], str, str]:
     url = f"{PSX_BASE}/timeseries/eod/{index_symbol}"
     try:
-        resp = _psx_get(url)
+        resp = _psx_get(url, api=True)
         if resp is None:
             msg = "Connection failed entirely (timeout/DNS/network — possibly IP blocked)"
             update_provider_status("psx_official", available=False, error=msg,
@@ -1315,6 +1346,15 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Target 1": round(result["risk"]["target1"], 2) if result["risk"].get("target1") else None,
                 "Cap Size": result["cap_size"], "Source": result["data_source"],
                 "Why": why_text, "Avg Volume": round(avg_volume, 0),
+                "RVOL": round(float(last["VOL_RATIO"]), 2) if not pd.isna(last["VOL_RATIO"]) else None,
+                "Pullback": result["pullback"]["status"],
+                "Momentum": result["momentum"]["label"],
+                "Resistance": round(float(result["breakout"]["resistance"]), 2)
+                              if result["breakout"].get("resistance") else None,
+                "Dist %": round(float(result["breakout"]["distance_to_resistance"]), 2)
+                          if result["breakout"].get("distance_to_resistance") is not None else None,
+                "52W": "🚀 BREAKOUT" if result["breakout"].get("is_52w_high_breakout")
+                       else "🔵 NEAR" if result["breakout"].get("is_near_52w_high") else "-",
                 "_ticker_raw": ticker,
             })
         except Exception as e:
@@ -1448,15 +1488,13 @@ def build_chart(result, show_bb=False, show_sma200=False,
     signal_label = result.get("signal", {}).get("signal", "")
     is_long_signal = signal_label in ("STRONG BUY", "BUY")
 
-    num_rows = 1
+    num_rows = 2  # price + volume (v8.8)
     if show_rsi: num_rows += 1
     if show_macd: num_rows += 1
-    row_heights = [0.5]
-    if show_rsi: row_heights.append(0.17)
-    if show_macd: row_heights.append(0.17)
-    if len(row_heights) == 3: row_heights = [0.5, 0.17, 0.17]
-    elif len(row_heights) == 2: row_heights = [0.6, 0.25]
-    subplot_titles = ["Price"]
+    row_heights = [0.58, 0.14]
+    if show_rsi: row_heights.append(0.14)
+    if show_macd: row_heights.append(0.14)
+    subplot_titles = ["Price", "Volume"]
     if show_rsi: subplot_titles.append("RSI (14)")
     if show_macd: subplot_titles.append("MACD")
 
@@ -1535,6 +1573,14 @@ def build_chart(result, show_bb=False, show_sma200=False,
                     row=row, col=1)
     except Exception:
         pass
+    # v8.8: volume panel (green/red by candle) + 20-day average
+    row += 1
+    vol_colors = np.where(d["Close"] >= d["Open"], "#10B981", "#EF4444")
+    fig.add_trace(go.Bar(x=d.index, y=d["Volume"], marker_color=vol_colors,
+        name="Volume", opacity=0.7), row=row, col=1)
+    if "VOL_SMA20" in d.columns:
+        fig.add_trace(go.Scatter(x=d.index, y=d["VOL_SMA20"],
+            line=dict(color="#6366F1", width=1.2), name="Vol avg20"), row=row, col=1)
     if show_rsi:
         row += 1
         fig.add_trace(go.Scatter(x=d.index, y=d["RSI14"],
@@ -1551,7 +1597,7 @@ def build_chart(result, show_bb=False, show_sma200=False,
         hist_colors = np.where(d["MACD_HIST"] >= 0, "#10B981", "#EF4444")
         fig.add_trace(go.Bar(x=d.index, y=d["MACD_HIST"],
             marker_color=hist_colors, name="Hist"), row=row, col=1)
-    fig.update_layout(height=700 if not show_rsi and not show_macd else 800,
+    fig.update_layout(height=760 if not show_rsi and not show_macd else 880,
         showlegend=True, xaxis_rangeslider_visible=False,
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
@@ -1626,7 +1672,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.7</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.8</div>", unsafe_allow_html=True)
 
 st.sidebar.subheader("🔌 Provider Status")
 psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
@@ -1697,11 +1743,11 @@ if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
 
 # ============================================================
-# MAIN TABS (6 tabs — Watchlist + Next Session removed)
+# MAIN TABS (7 tabs — Pullbacks added in v8.8)
 # ============================================================
 
-tab_dash, tab_screener, tab_breakouts, tab_port, tab_market, tab_top = st.tabs([
-    "📊 Dashboard", "🔍 Screener", "🚀 Breakouts",
+tab_dash, tab_screener, tab_breakouts, tab_pull, tab_port, tab_market, tab_top = st.tabs([
+    "📊 Dashboard", "🔍 Screener", "🚀 Breakouts", "🔁 Pullbacks",
     "💼 Portfolio", "📈 Market", "🎯 Top Picks"])
 
 # ============================================================
@@ -2010,58 +2056,90 @@ with tab_screener:
             st.info("No stocks match filters")
 
 # ============================================================
-# BREAKOUTS TAB (with Entry/Stop/Target)
+# BREAKOUTS TAB (v8.8: distinct - filter over Screener results, no re-analysis)
 # ============================================================
 
+BREAKOUT_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
+                 "Gate", "Confidence", "Status", "RVOL", "Resistance", "Dist %",
+                 "Entry", "Stop Loss", "Target 1", "RR", "RR Flag", "Momentum", "52W", "Why"]
+PULLBACK_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
+                 "Gate", "Confidence", "Pullback", "Entry", "Stop Loss", "Target 1",
+                 "RR", "RR Flag", "RVOL", "Momentum", "Why"]
+
 with tab_breakouts:
-    st.subheader("🚀 Breakout Candidates")
+    st.subheader("🚀 Breakouts")
+    st.caption("Sirf woh stocks jo resistance tod chuke hain ya tootne ke qareeb hain. "
+               "Screener ke results se filter hota hai (naya scan nahi).")
     if "screener_df" not in st.session_state:
         st.info("Pehle Screener tab pe 'Run Screener' chalao.")
     else:
         df_s = st.session_state["screener_df"]
-        if df_s.empty or "Status" not in df_s.columns:
-            st.info("Screener output khali hai — dobara Run Screener chalao.")
+        needed = {"Status", "RVOL", "52W"}
+        if df_s.empty or not needed.issubset(df_s.columns):
+            st.info("Screener output purana/khali hai — dobara Run Screener chalao.")
         else:
-            keywords = ["CONFIRMED", "READY", "ATTEMPT", "BREAKOUT"]
-            bo = df_s[df_s["Status"].astype(str).str.contains('|'.join(keywords), case=False, na=False)]
-            if bo.empty:
-                st.info("Koi breakout candidate nahi mila.")
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                bo_mode = st.radio("Breakout type",
+                    ["Confirmed / 52W breakout", "Near breakout + volume", "Sab (confirmed + near)"],
+                    horizontal=True, key="bo_mode")
+            with c2:
+                bo_rvol = st.number_input("Min RVOL", min_value=0.0, max_value=20.0,
+                    value=2.0, step=0.5, key="bo_rvol",
+                    help="Relative volume: aaj ka volume / 20-din average. 2.0 = double.")
+            work = df_s[df_s["Signal"] != "ERROR"].copy()
+            status_s = work["Status"].astype(str)
+            rvol_s = pd.to_numeric(work["RVOL"], errors="coerce").fillna(0)
+            confirmed = status_s.str.contains("CONFIRMED", case=False, na=False) | \
+                        work["52W"].astype(str).str.contains("BREAKOUT", na=False)
+            near = status_s.str.contains("READY|ATTEMPT", case=False, na=False) & ~confirmed
+            if bo_mode.startswith("Confirmed"):
+                bo = work[confirmed & (rvol_s >= bo_rvol)]
+            elif bo_mode.startswith("Near"):
+                bo = work[near & (rvol_s >= bo_rvol)]
             else:
-                breakout_rows = []
-                market = market_snapshot()
-                for _, row in bo.iterrows():
-                    ticker_raw = row.get("_ticker_raw", row["Ticker"])
-                    try:
-                        result, status, _, _ = analyze_stock(ticker_raw, period="1y",
-                            penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
-                    except Exception:
-                        continue
-                    if status == "SUCCESS" and result is not None:
-                        breakout_rows.append({
-                            "Ticker": row["Ticker"], "Price": row["Price"],
-                            "Price Src": row.get("Price Src", "📅 yf"),
-                            "Change %": row["Change %"], "Trend": row["Trend"],
-                            "Score": row["Score"], "Signal": row["Signal"],
-                            "Gate": row.get("Gate", "-"),
-                            "Confidence": row.get("Confidence", "N/A"),
-                            "Status": row["Status"],
-                            "Resistance": round(result["breakout"]["resistance"], 2),
-                            "Dist %": round(result["breakout"]["distance_to_resistance"], 2)
-                                        if result["breakout"]["distance_to_resistance"] is not None else "N/A",
-                            "Entry": row.get("Entry"),
-                            "Stop Loss": row.get("Stop Loss"),
-                            "Target 1": row.get("Target 1"),
-                            "RR": row["RR"],
-                            "RR Flag": row.get("RR Flag", ""),
-                            "Momentum": result["momentum"]["label"],
-                            "52W": "🚀 BREAKOUT" if result["breakout"]["is_52w_high_breakout"]
-                                   else "🔵 NEAR" if result["breakout"]["is_near_52w_high"] else "-",
-                            "Why": row["Why"]})
-                if breakout_rows:
-                    bo_df = pd.DataFrame(breakout_rows).sort_values("Score", ascending=False)
-                    st.dataframe(bo_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Koi detailed breakout data available nahi.")
+                bo = work[(confirmed | near) & (rvol_s >= bo_rvol)]
+            if bo.empty:
+                st.info(f"Koi candidate nahi mila (RVOL >= {bo_rvol}). "
+                        "RVOL kam karke dekho ya Screener ka universe/filters check karo.")
+            else:
+                cols = [c for c in BREAKOUT_COLS if c in bo.columns]
+                st.dataframe(bo.sort_values("RVOL", ascending=False)[cols],
+                             use_container_width=True, hide_index=True)
+                st.caption("Volume ke bina breakout aksar jhootha hota hai (false breakout) — "
+                           "RVOL aur RR Flag dono dekho. Entry/Stop/Target technical levels hain.")
+
+# ============================================================
+# PULLBACKS TAB (v8.8 NEW: swing entries near support / EMA20 in an uptrend)
+# ============================================================
+
+with tab_pull:
+    st.subheader("🔁 Pullbacks (Swing Entries)")
+    st.caption("Bullish trend wale stocks jo support ya EMA20 ke qareeb wapas aaye hain. "
+               "Breakout ka ulta idea: tez bhaag chuke stock ko chase karne ke bajaye dip pe entry.")
+    if "screener_df" not in st.session_state:
+        st.info("Pehle Screener tab pe 'Run Screener' chalao.")
+    else:
+        df_s = st.session_state["screener_df"]
+        if df_s.empty or "Pullback" not in df_s.columns:
+            st.info("Screener output purana/khali hai — dobara Run Screener chalao.")
+        else:
+            only_healthy = st.checkbox("Sirf HEALTHY PULLBACK (confirmation ke saath)", value=False,
+                                       key="pb_healthy")
+            work = df_s[df_s["Signal"] != "ERROR"].copy()
+            pb_s = work["Pullback"].astype(str)
+            mask = pb_s.str.contains("HEALTHY") if only_healthy else pb_s.str.contains("PULLBACK")
+            mask &= work["Trend"].isin(["BULLISH", "STRONG BULLISH"])
+            pb = work[mask]
+            if pb.empty:
+                st.info("Abhi koi pullback setup nahi mila. Bearish/sideways market mein yeh normal hai.")
+            else:
+                cols = [c for c in PULLBACK_COLS if c in pb.columns]
+                st.dataframe(pb.sort_values("Score", ascending=False)[cols],
+                             use_container_width=True, hide_index=True)
+                st.caption("HEALTHY PULLBACK = support/EMA20 ke paas + RSI 35-55 + bullish candle. "
+                           "PULLBACK WATCH = qareeb hai lekin confirmation baqi. "
+                           "Stop Loss ke neeche close ho to setup khatam.")
 
 # ============================================================
 # PORTFOLIO TAB
