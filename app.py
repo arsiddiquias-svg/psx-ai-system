@@ -1,21 +1,26 @@
 """
-PSX QUANT ENGINE - v8.8
+PSX QUANT ENGINE - v8.9
 ========================
 PSX-focused quantitative decision-support terminal.
 
-CHANGELOG v8.8:
-- PSX HEADERS: API calls now send XHR-style headers (Accept: json, Referer,
-  X-Requested-With, Sec-Fetch-Mode cors/same-origin) instead of looking like
-  a page navigation. Removed "br" from Accept-Encoding (requests cannot decode
-  brotli without an extra package -> garbled body). One retry on failure.
-- BREAKOUTS tab is now distinct: pure filter over Screener results (no
-  re-analysis), confirmed / 52W breakouts or near-breakout with RVOL >= X.
-- NEW PULLBACKS tab: bullish-trend stocks pulling back to support / EMA20
-  (swing entries) with Entry / Stop / Target.
-- CHART: volume sub-panel (with 20-day volume average) added.
-- Screener rows now carry RVOL, Pullback, Momentum, Resistance, Dist %, 52W.
-- PRESERVE: everything from v8.7 (diagnostic probe, Entry/Stop/Target,
-  Confidence, live PSX price override, Gate, RR Flag, Portfolio freshness).
+CHANGELOG v8.9  (root-cause fix for the PSX data outage):
+- ROOT CAUSE: since 2026-09-24 PSX rejects data requests with HTTP 403 unless
+  they carry an `X-Req-Id` header equal to the token PSX embeds in every HTML
+  page (`window.__ps._k`; rotates ~every 5 min). Source: the open-source
+  `psxdata` 1.2.0 package (constants.py / scrapers/token.py). The old
+  /market-watch page now returns 404.
+- NEW: token manager (fetch homepage -> extract token -> send X-Req-Id,
+  refresh every 240s, one refresh+retry on 403).
+- NEW: market snapshot / scan universe now come from
+  /trading-board/REG/main (replaces the dead /market-watch page).
+- NEW: per-stock OHLCV from PSX official (POST /historical, one request
+  returns the full history) is now the PRIMARY source; yfinance is fallback.
+- NEW: KSE-100 chain: /timeseries/eod -> POST /historical(KSE100) -> yfinance.
+- FIX: Provider Status is now persisted across reruns (it used to reset when
+  cached fetches were skipped, showing "Not available" while PSX was working).
+- NEW: Diagnostic Probe tests with-token vs without-token to prove/disprove
+  the token cause on the live deployment.
+- PRESERVE: everything from v8.8.
 
 DEPLOYMENT:
 - Python 3.11 or 3.12 recommended
@@ -28,7 +33,11 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, date
+import os
+import re
+import json
 import time
+import threading
 import requests
 from io import StringIO
 from typing import Optional, Tuple, Dict, Any, List, Union
@@ -38,7 +47,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.8",
+    page_title="PSX Quant Engine v8.9",
     page_icon="📈",
     layout="wide"
 )
@@ -129,17 +138,28 @@ PSX_FALLBACK_UNIVERSE = list(dict.fromkeys(PSX_LIQUID_UNIVERSE + PSX_SMALL_CAP_U
 # ============================================================
 # v8.7: Added "diagnostic" field to capture raw PSX error details.
 
-PROVIDER_STATUS = {
-    "psx_official": {"available": False, "last_success": None, "error": None,
-                     "diagnostic": None, "coverage": 0, "kse100": False,
-                     "last_fetch_attempt": None},
-    "psxdata":      {"available": False, "last_success": None, "error": None,
-                     "diagnostic": None, "coverage": 0, "kse100": False,
-                     "last_fetch_attempt": None},
-    "yfinance":     {"available": True,  "last_success": None, "error": None,
-                     "diagnostic": None, "coverage": 0, "kse100": False,
-                     "last_fetch_attempt": None},
-}
+@st.cache_resource(show_spinner=False)
+def _psx_state() -> Dict[str, Any]:
+    """Process-wide state that survives Streamlit reruns (session, token, provider status)."""
+    return {
+        "session": None, "token": None, "token_ts": 0.0, "token_fail_ts": 0.0,
+        "token_err": None, "last_req": 0.0, "lock": threading.RLock(),
+        "fail_streak": 0, "breaker_until": 0.0,
+        "providers": {
+            "psx_official": {"available": False, "last_success": None, "error": None,
+                             "diagnostic": None, "coverage": 0, "kse100": False,
+                             "last_fetch_attempt": None},
+            "psxdata":      {"available": False, "last_success": None, "error": None,
+                             "diagnostic": None, "coverage": 0, "kse100": False,
+                             "last_fetch_attempt": None},
+            "yfinance":     {"available": True,  "last_success": None, "error": None,
+                             "diagnostic": None, "coverage": 0, "kse100": False,
+                             "last_fetch_attempt": None},
+        },
+    }
+
+# v8.9: shared dict -> status no longer resets when cached fetches are skipped.
+PROVIDER_STATUS = _psx_state()["providers"]
 
 def update_provider_status(provider: str, available: bool = None, error: str = None,
                            coverage: int = None, kse100: bool = None,
@@ -243,140 +263,278 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
 # v8.7: Raw diagnostic capture on failure.
 # ============================================================
 
-PSX_BASE = "https://dps.psx.com.pk"
+PSX_BASE = os.environ.get("PSX_BASE_URL", "https://dps.psx.com.pk")  # env override = test hook
 PSX_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36")
 
-_LAST_PSX_REQUEST_TS = 0.0
-_PSX_MIN_INTERVAL = 1.0
-_PSX_SESSION: Optional[requests.Session] = None
+PSX_TOKEN_HEADER = "X-Req-Id"
+PSX_TOKEN_TTL = 240        # seconds; PSX rotates the token roughly every 5 minutes
+PSX_TOKEN_BACKOFF = 60     # seconds before retrying after a failed token fetch
+_PSX_MIN_INTERVAL = 0.5    # ~2 requests / second
+_PS_SCRIPT_RE = re.compile(r"window\.__ps\s*=\s*(\{.*?\})\s*(?:;|</script>)", re.DOTALL)
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+
+def extract_psx_token(html: str) -> Optional[str]:
+    """Return the `window.__ps._k` token embedded in a PSX HTML page, or None."""
+    m = _PS_SCRIPT_RE.search(html or "")
+    if m is None:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except ValueError:
+        return None
+    tok = payload.get("_k") if isinstance(payload, dict) else None
+    if not isinstance(tok, str) or not _TOKEN_RE.fullmatch(tok):
+        return None
+    return tok
 
 def _get_psx_session() -> requests.Session:
-    global _PSX_SESSION
-    if _PSX_SESSION is None:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": PSX_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                      "image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            # NOTE: no "br" - requests cannot decode brotli without extra package
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        })
-        try:
-            s.get(PSX_BASE + "/", timeout=10)
-        except Exception:
-            pass
-        _PSX_SESSION = s
-    return _PSX_SESSION
+    stt = _psx_state()
+    with stt["lock"]:
+        if stt["session"] is None:
+            s = requests.Session()
+            s.headers.update({
+                "User-Agent": PSX_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                          "image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                # no "br": requests cannot decode brotli without an extra package
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            })
+            stt["session"] = s
+        return stt["session"]
 
-def _psx_request_headers(api: bool) -> Dict[str, Optional[str]]:
-    """Per-request headers. API (XHR/JSON) calls must not look like navigations.
-    A value of None removes the session default for that request."""
-    if api:
-        return {
-            "Accept": "application/json, text/plain, */*",
-            "Referer": PSX_BASE + "/",
-            "X-Requested-With": "XMLHttpRequest",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": None,
-            "Upgrade-Insecure-Requests": None,
-        }
+def get_psx_token(force: bool = False) -> Optional[str]:
+    """Fetch/cached PSX request token. Fails open (returns None, records the reason)."""
+    stt = _psx_state()
+    with stt["lock"]:
+        now = time.time()
+        if not force and stt["token"] and now - stt["token_ts"] < PSX_TOKEN_TTL:
+            return stt["token"]
+        if not force and stt["token_fail_ts"] and now - stt["token_fail_ts"] < PSX_TOKEN_BACKOFF:
+            return None
+        err = None
+        try:
+            r = _get_psx_session().get(PSX_BASE + "/", timeout=15)
+            if r.status_code != 200:
+                err = f"token page HTTP {r.status_code}"
+            else:
+                tok = extract_psx_token(r.text)
+                if tok:
+                    stt.update(token=tok, token_ts=time.time(), token_fail_ts=0.0, token_err=None)
+                    return tok
+                err = "window.__ps._k not found in homepage HTML"
+        except Exception as e:
+            err = f"token fetch failed: {type(e).__name__}: {str(e)[:100]}"
+        stt.update(token=None, token_fail_ts=time.time(), token_err=err)
+        return None
+
+def _psx_request_headers(kind: str) -> Dict[str, Optional[str]]:
+    """kind: 'json' | 'html_xhr' | 'page'. None value = drop the session default."""
+    if kind == "json":
+        return {"Accept": "application/json, text/plain, */*",
+                "Referer": PSX_BASE + "/", "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": None,
+                "Upgrade-Insecure-Requests": None}
+    if kind == "html_xhr":
+        return {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": PSX_BASE + "/", "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": None,
+                "Upgrade-Insecure-Requests": None}
     return {"Referer": PSX_BASE + "/", "Sec-Fetch-Site": "same-origin"}
 
-def _psx_get(url: str, timeout: int = 15, api: bool = False,
-             retries: int = 1) -> Optional[requests.Response]:
-    global _LAST_PSX_REQUEST_TS
+def _psx_request(method: str, url: str, kind: str = "html_xhr", data: Optional[dict] = None,
+                 timeout: int = 20, retries: int = 1,
+                 use_breaker: bool = True) -> Optional[requests.Response]:
+    """Rate-limited PSX request with X-Req-Id token, one token-refresh retry on 403
+    (only if a token was actually sent), `retries` retries on network errors / 5xx, and a
+    circuit breaker: after 6 consecutive failures PSX data calls are skipped for 120 s so
+    scans fall back to yfinance quickly instead of hammering a failing endpoint."""
+    stt = _psx_state()
+    if use_breaker and kind != "page" and time.time() < stt["breaker_until"]:
+        return None
     resp = None
-    for attempt in range(retries + 1):
-        elapsed = time.time() - _LAST_PSX_REQUEST_TS
-        if elapsed < _PSX_MIN_INTERVAL:
-            time.sleep(_PSX_MIN_INTERVAL - elapsed)
+    attempt = 0
+    refreshed = False
+    while attempt <= retries:
+        headers = dict(_psx_request_headers(kind))
+        sent_token = False
+        if kind != "page":
+            tok = get_psx_token()
+            if tok:
+                headers[PSX_TOKEN_HEADER] = tok
+                sent_token = True
+        with stt["lock"]:
+            wait = stt["last_req"] + _PSX_MIN_INTERVAL - time.time()
+            stt["last_req"] = max(time.time(), stt["last_req"] + _PSX_MIN_INTERVAL)
+        if wait > 0:
+            time.sleep(wait)
         try:
-            session = _get_psx_session()
-            resp = session.get(url, timeout=timeout, headers=_psx_request_headers(api))
-            _LAST_PSX_REQUEST_TS = time.time()
-            if resp.status_code < 500:
-                return resp
+            resp = _get_psx_session().request(method, url, data=data, headers=headers,
+                                              timeout=timeout)
         except Exception:
-            _LAST_PSX_REQUEST_TS = time.time()
             resp = None
-        if attempt < retries:
-            time.sleep(2.0)
+        if resp is not None:
+            if resp.status_code == 403 and kind != "page" and sent_token and not refreshed:
+                refreshed = True
+                get_psx_token(force=True)       # token rejected/expired -> refresh once
+                continue                         # same attempt number
+            if resp.status_code < 500:
+                break
+        attempt += 1
+        if attempt <= retries:
+            time.sleep(1.5)
+    if kind != "page":
+        failed = resp is None or resp.status_code in (401, 403) or resp.status_code >= 500
+        with stt["lock"]:
+            if failed:
+                stt["fail_streak"] += 1
+                if stt["fail_streak"] >= 6:
+                    stt["breaker_until"] = time.time() + 120
+                    stt["fail_streak"] = 0
+            else:
+                stt["fail_streak"] = 0
     return resp
 
+def _psx_get(url: str, timeout: int = 15, api: bool = False, retries: int = 1,
+             kind: Optional[str] = None, use_breaker: bool = True) -> Optional[requests.Response]:
+    return _psx_request("GET", url, kind or ("json" if api else "html_xhr"),
+                        timeout=timeout, retries=retries, use_breaker=use_breaker)
+
+def _psx_post(url: str, data: dict, timeout: int = 25, retries: int = 1,
+              use_breaker: bool = True) -> Optional[requests.Response]:
+    return _psx_request("POST", url, "html_xhr", data=data, timeout=timeout,
+                        retries=retries, use_breaker=use_breaker)
+
+def _first_table(html: str) -> Optional[pd.DataFrame]:
+    """Largest HTML table in a PSX response (header names kept as-is)."""
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        return None
+    if not tables:
+        return None
+    return max(tables, key=lambda t: t.shape[0] * t.shape[1])
+
 def diagnostic_psx_probe() -> str:
-    """
-    Standalone probe: hits PSX homepage + KSE-100 endpoint, reports raw
-    network behavior. Called from UI diagnostic button.
-    """
-    lines = []
-    lines.append(f"**Timestamp:** {pkt_now().strftime('%Y-%m-%d %H:%M:%S PKT')}")
-    lines.append(f"**User-Agent:** `{PSX_USER_AGENT}`")
-    lines.append("")
-    # Probe 1: homepage
-    lines.append("### Probe 1: Homepage (`https://dps.psx.com.pk/`)")
+    """Live probe. Reports token extraction, each endpoint WITH token, and a control
+    request WITHOUT token (proves/disproves the X-Req-Id cause)."""
+    L: List[str] = []
+    L.append(f"**Timestamp:** {pkt_now().strftime('%Y-%m-%d %H:%M:%S PKT')}")
+    L.append(f"**Base:** `{PSX_BASE}`")
+    L.append("")
+    # --- 1. homepage + token
+    L.append("### 1) Homepage + request token")
+    tok = None
     try:
-        session = _get_psx_session()
-        r = session.get(PSX_BASE + "/", timeout=10)
-        lines.append(f"- HTTP status: `{r.status_code}`")
-        lines.append(f"- Content length: `{len(r.text)}` bytes")
-        lines.append(f"- Server: `{r.headers.get('Server', 'n/a')}`")
-        lines.append(f"- Content-Type: `{r.headers.get('Content-Type', 'n/a')}`")
-    except Exception as e:
-        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
-    lines.append("")
-    # Probe 2: KSE-100 EOD
-    lines.append("### Probe 2: KSE-100 EOD (`/timeseries/eod/KSE100`)")
-    try:
-        r = _psx_get(f"{PSX_BASE}/timeseries/eod/KSE100", timeout=15, api=True)
-        if r is None:
-            lines.append("- ❌ No response at all (timeout / DNS / connection refused)")
-            lines.append("- **Likely cause:** IP-level block from PSX. Streamlit Cloud "
-                         "egress IPs may be blocked. Fix requires Pakistan-based hosting "
-                         "or a proxy — code-level fix won't help.")
+        r = _get_psx_session().get(PSX_BASE + "/", timeout=15)
+        L.append(f"- HTTP `{r.status_code}` · `{len(r.text)}` bytes · server `{r.headers.get('Server', 'n/a')}`")
+        has_ps = "window.__ps" in r.text
+        L.append(f"- `window.__ps` present in HTML: **{has_ps}**")
+        tok = extract_psx_token(r.text)
+        if tok:
+            L.append(f"- Token extracted: ✅ length {len(tok)}, starts `{tok[:6]}…`")
+            stt = _psx_state()
+            with stt["lock"]:
+                stt.update(token=tok, token_ts=time.time(), token_fail_ts=0.0, token_err=None)
         else:
-            lines.append(f"- HTTP status: `{r.status_code}`")
-            lines.append(f"- Content length: `{len(r.text)}` bytes")
-            lines.append(f"- Content-Type: `{r.headers.get('Content-Type', 'n/a')}`")
-            if r.status_code in (403, 429):
-                lines.append(f"- **Likely cause:** Bot detection / rate limit. "
-                             f"Headers or proxy may help.")
-            elif r.status_code == 200:
-                body_preview = r.text[:200].replace("\n", " ")
-                lines.append(f"- Body preview: `{body_preview}`")
-                if len(r.text) < 50:
-                    lines.append("- **Likely cause:** Endpoint returned empty. "
-                                 "URL may have changed.")
+            L.append("- Token extracted: ❌ NOT FOUND")
+            if has_ps:
+                i = r.text.index("window.__ps")
+                L.append(f"- Context: `{r.text[i:i+160]!r}`")
             else:
-                lines.append(f"- **HTTP {r.status_code}** — unexpected. Inspect body.")
+                srcs = re.findall(r'<script[^>]+src="([^"]+)"', r.text)[:6]
+                L.append(f"- Script tags (first 6): `{srcs}`")
     except Exception as e:
-        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
-    lines.append("")
-    # Probe 3: Market watch
-    lines.append("### Probe 3: Market Watch (`/market-watch`)")
+        L.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:160]}`")
+    L.append("")
+
+    def _describe(resp, show_cols=False):
+        if resp is None:
+            L.append("- ❌ No response (timeout / DNS / connection refused)")
+            return
+        L.append(f"- HTTP `{resp.status_code}` · `{len(resp.content)}` bytes · "
+                 f"type `{resp.headers.get('Content-Type', 'n/a')}`")
+        if resp.status_code == 200:
+            t = _first_table(resp.text)
+            if t is not None:
+                L.append(f"- Table rows: `{len(t)}` · columns: `{[str(c) for c in t.columns][:9]}`")
+                if show_cols and len(t):
+                    L.append(f"- First row: `{[str(x) for x in t.iloc[0].tolist()][:9]}`")
+                    L.append(f"- Last row: `{[str(x) for x in t.iloc[-1].tolist()][:9]}`")
+            else:
+                L.append(f"- Body preview: `{resp.text[:160]!r}`")
+        elif resp.status_code == 403:
+            L.append("- 403: request rejected (token missing/expired/rejected)")
+        elif resp.status_code == 404:
+            L.append("- 404: path does not exist (page removed/renamed)")
+
+    # --- 2. trading board WITH token
+    L.append("### 2) Trading board `/trading-board/REG/main` (with token)")
+    r_tb = None
     try:
-        r = _psx_get(f"{PSX_BASE}/market-watch", timeout=15)
-        if r is None:
-            lines.append("- ❌ No response at all (timeout / DNS / connection refused)")
-        else:
-            lines.append(f"- HTTP status: `{r.status_code}`")
-            lines.append(f"- Content length: `{len(r.text)}` bytes")
-            if r.status_code == 200:
-                body_preview = r.text[:200].replace("\n", " ")
-                lines.append(f"- Body preview: `{body_preview}`")
+        r_tb = _psx_get(f"{PSX_BASE}/trading-board/REG/main", timeout=20, kind="html_xhr", use_breaker=False)
+        _describe(r_tb, show_cols=True)
     except Exception as e:
-        lines.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:200]}`")
-    return "\n".join(lines)
+        L.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:160]}`")
+    L.append("")
+    # --- 3. control: same request WITHOUT token
+    L.append("### 3) Control: same request WITHOUT token")
+    r_ctl = None
+    try:
+        time.sleep(_PSX_MIN_INTERVAL)
+        r_ctl = _get_psx_session().get(f"{PSX_BASE}/trading-board/REG/main", timeout=20,
+                                       headers=_psx_request_headers("html_xhr"))
+        _describe(r_ctl)
+    except Exception as e:
+        L.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:160]}`")
+    L.append("")
+    # --- 4. historical
+    L.append("### 4) Per-stock history `POST /historical` (symbol=OGDC)")
+    try:
+        r_h = _psx_post(f"{PSX_BASE}/historical", {"symbol": "OGDC"}, use_breaker=False)
+        _describe(r_h, show_cols=True)
+    except Exception as e:
+        L.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:160]}`")
+    L.append("")
+    # --- 5. legacy endpoints
+    L.append("### 5) Legacy endpoints (old app used these)")
+    for path, kind in (("/timeseries/eod/KSE100", "json"), ("/market-watch", "page")):
+        try:
+            r_o = _psx_get(f"{PSX_BASE}{path}", timeout=15, kind=kind, use_breaker=False)
+            L.append(f"**`{path}`**")
+            _describe(r_o)
+        except Exception as e:
+            L.append(f"- `{path}` ❌ `{type(e).__name__}: {str(e)[:120]}`")
+    L.append("")
+    stt_ = _psx_state()
+    if r_tb is not None and r_tb.status_code == 200:
+        with stt_["lock"]:
+            stt_["breaker_until"] = 0.0; stt_["fail_streak"] = 0
+    # --- verdict
+    L.append("### Verdict")
+    ok_with = r_tb is not None and r_tb.status_code == 200
+    ok_without = r_ctl is not None and r_ctl.status_code == 200
+    if ok_with and r_ctl is not None and r_ctl.status_code == 403:
+        L.append("- ✅ **Token fix confirmed**: with token = 200, without token = 403.")
+    elif ok_with and ok_without:
+        L.append("- ℹ️ Works with and without token (PSX may have relaxed the token rule).")
+    elif tok and not ok_with:
+        L.append("- ⚠️ Token was extracted but the trading board still failed — "
+                 "see status above (path or IP-bound token issue).")
+    elif not tok:
+        L.append("- ❌ No token could be extracted from the homepage — PSX may have changed "
+                 "how the token is embedded. Send me this report.")
+    return "\n".join(L)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optional[pd.DataFrame], str, str]:
@@ -437,22 +595,27 @@ def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optiona
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]:
-    url = f"{PSX_BASE}/market-watch"
+    """v8.9: live snapshot of all symbols from /trading-board/REG/main
+    (the old /market-watch page returns 404 since the PSX site change)."""
+    url = f"{PSX_BASE}/trading-board/REG/main"
     try:
-        resp = _psx_get(url)
+        resp = _psx_get(url, timeout=20, kind="html_xhr")
         if resp is None:
-            msg = "Connection failed entirely (timeout/DNS/network — possibly IP blocked)"
-            update_provider_status("psx_official", available=False, error=msg)
+            msg = "Connection failed entirely (timeout/DNS/network)"
+            update_provider_status("psx_official", available=False, error=msg,
+                                   diagnostic=f"No response from {url}")
             return None, "EMPTY", msg
         if resp.status_code != 200:
-            msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            hint = " (token rejected?)" if resp.status_code == 403 else ""
+            msg = f"HTTP {resp.status_code}{hint} on trading-board: {resp.text[:120]!r}"
+            update_provider_status("psx_official", available=False, error=msg,
+                                   diagnostic=f"Status {resp.status_code} on {url}")
+            return None, "EMPTY", msg
+        df = _first_table(resp.text)
+        if df is None or df.empty:
+            msg = "HTTP 200 but no table parsed from trading-board HTML"
             update_provider_status("psx_official", available=False, error=msg)
             return None, "EMPTY", msg
-        tables = pd.read_html(StringIO(resp.text))
-        if not tables:
-            msg = "HTTP 200 but no tables parsed from HTML"
-            return None, "EMPTY", msg
-        df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
         rename_map = {}
         for c in df.columns:
             cl = str(c).strip().lower()
@@ -469,22 +632,37 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
             elif "volume" in cl:               rename_map[c] = "Volume"
         df = df.rename(columns=rename_map)
         if "Symbol" not in df.columns or "Current" not in df.columns:
-            msg = f"Columns missing: {list(df.columns)[:8]}"
+            msg = f"Columns missing: {[str(c) for c in df.columns][:9]}"
+            update_provider_status("psx_official", available=False, error=msg)
             return None, "EXCEPTION", msg
         for col in ["LDCP", "Open", "High", "Low", "Current", "Change", "Change_Pct", "Volume"]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "").str.replace("%", "").str.strip(), errors="coerce")
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "")
+                                        .str.replace("%", "").str.strip(), errors="coerce")
         df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-        df = df[df["Symbol"].str.len() > 0].dropna(subset=["Current"])
+        df = df[df["Symbol"].str.fullmatch(r"[A-Z0-9&-]{2,15}")].dropna(subset=["Current"])
+        df = df.drop_duplicates(subset="Symbol", keep="first")
+        if df.empty:
+            msg = "Trading board parsed but no valid symbol rows"
+            update_provider_status("psx_official", available=False, error=msg)
+            return None, "EMPTY", msg
         update_provider_status("psx_official", available=True, coverage=len(df), diagnostic=None)
         return df, "SUCCESS", None
     except Exception as e:
-        msg = f"Market-watch error: {str(e)[:150]}"
+        msg = f"Trading-board error: {type(e).__name__}: {str(e)[:150]}"
+        update_provider_status("psx_official", available=False, error=msg)
         return None, "EXCEPTION", msg
 
 # ============================================================
 # LIVE PSX PRICE
 # ============================================================
+
+def _price_src_label(result: Dict) -> str:
+    if result.get("display_price_source") == "psx_official_live":
+        return "📍 PSX live"
+    if str(result.get("data_source", "")).startswith("psx_official"):
+        return "📅 PSX EOD"
+    return "📅 yf"
 
 def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
     try:
@@ -635,12 +813,75 @@ def _validate_ohlcv(df: pd.DataFrame) -> Tuple[bool, str]:
     if len(df) < MIN_HISTORY_DAYS: return False, f"Insufficient history: {len(df)} < {MIN_HISTORY_DAYS}"
     return True, "Valid"
 
+def _parse_psx_history(html: str) -> Optional[pd.DataFrame]:
+    """HTML table (DATE/OPEN/HIGH/LOW/CLOSE/VOLUME) -> clean ascending OHLCV frame."""
+    t = _first_table(html)
+    if t is None or t.empty:
+        return None
+    ren = {}
+    for c in t.columns:
+        cl = str(c).strip().lower()
+        if cl == "date": ren[c] = "Date"
+        elif cl == "open": ren[c] = "Open"
+        elif cl == "high": ren[c] = "High"
+        elif cl == "low": ren[c] = "Low"
+        elif cl == "close": ren[c] = "Close"
+        elif cl.startswith("vol"): ren[c] = "Volume"
+    t = t.rename(columns=ren)
+    need = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    if any(c not in t.columns for c in need):
+        return None
+    t = t[need].copy()
+    t["Date"] = pd.to_datetime(t["Date"], errors="coerce")
+    for c in need[1:]:
+        t[c] = pd.to_numeric(t[c].astype(str).str.replace(",", "").str.strip(), errors="coerce")
+    t = t.dropna(subset=["Date"] + need[1:5])
+    # drop non-trading / corrupt rows instead of rejecting the whole history
+    t = t[(t[["Open", "High", "Low", "Close"]] > 0).all(axis=1)]
+    t["Volume"] = t["Volume"].fillna(0).clip(lower=0)
+    t = t[(t["High"] >= t["Low"]) & (t["High"] >= t["Open"]) & (t["High"] >= t["Close"]) &
+          (t["Low"] <= t["Open"]) & (t["Low"] <= t["Close"])]
+    t = t.drop_duplicates(subset="Date", keep="last").sort_values("Date").set_index("Date")
+    t.index = pd.DatetimeIndex(t.index).tz_localize(None).normalize()
+    return t[["Open", "High", "Low", "Close", "Volume"]]
+
+def fetch_psx_official_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str]:
+    """v8.9: official PSX EOD history. POST /historical returns the FULL history in one call."""
+    sym = normalize_ticker_display(ticker)
+    url = f"{PSX_BASE}/historical"
+    try:
+        resp = _psx_post(url, {"symbol": sym})
+        if resp is None:
+            msg = "PSX /historical: no response"
+            update_provider_status("psx_official", available=False, error=msg)
+            return None, "EMPTY", msg
+        if resp.status_code != 200:
+            hint = " (token rejected?)" if resp.status_code == 403 else ""
+            msg = f"PSX /historical HTTP {resp.status_code}{hint}"
+            update_provider_status("psx_official", available=False, error=msg)
+            return None, "EMPTY", msg
+        df = _parse_psx_history(resp.text)
+        if df is None or df.empty:
+            return None, "EMPTY", f"PSX /historical: no table for {sym}"
+        days = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}.get(period, 365)
+        df = df[df.index >= (df.index.max() - pd.Timedelta(days=days))]
+        valid, vmsg = _validate_ohlcv(df)
+        if not valid:
+            return None, "EXCEPTION", f"PSX history invalid for {sym}: {vmsg}"
+        update_provider_status("psx_official", available=True, coverage=len(df))
+        return df, "SUCCESS", f"psx_official ({sym})"
+    except Exception as e:
+        msg = f"PSX /historical error: {type(e).__name__}: {str(e)[:120]}"
+        update_provider_status("psx_official", available=False, error=msg)
+        return None, "EXCEPTION", msg
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_ohlcv(ticker: str, period: str = "1y") -> Tuple[Optional[pd.DataFrame], str, str, str]:
+    """Order: PSX official (/historical) -> yfinance."""
     provider_attempts = []
-    df, status, error = fetch_psxdata_ohlcv(ticker, period)
-    provider_attempts.append(f"psxdata: {status}")
-    if status == "SUCCESS": return df, status, error, "psxdata"
+    df, status, error = fetch_psx_official_ohlcv(ticker, period)
+    provider_attempts.append(f"psx_official: {status} {error or ''}".strip())
+    if status == "SUCCESS": return df, status, error, "psx_official"
     df, status, error = fetch_yfinance_ohlcv(ticker, period)
     provider_attempts.append(f"yfinance: {status}")
     if status == "SUCCESS": return df, status, error, "yfinance"
@@ -653,6 +894,17 @@ def fetch_market_index():
         last_close = float(df["Close"].iloc[-1])
         if KSE100_PLAUSIBLE_MIN <= last_close <= KSE100_PLAUSIBLE_MAX:
             return df, "psx_official (KSE100 EOD, verified)"
+    # v8.9: second PSX route - same /historical endpoint stocks use, symbol=KSE100
+    try:
+        h = _parse_psx_history(_psx_post(f"{PSX_BASE}/historical", {"symbol": "KSE100"}).text)
+        if h is not None and len(h) >= 40:
+            h = h[h.index >= (h.index.max() - pd.Timedelta(days=1100))]
+            lc = float(h["Close"].iloc[-1])
+            if KSE100_PLAUSIBLE_MIN <= lc <= KSE100_PLAUSIBLE_MAX:
+                update_provider_status("psx_official", available=True, kse100=True, coverage=len(h))
+                return h, "psx_official (KSE100 /historical, verified)"
+    except Exception:
+        pass
     for cand in KSE100_CANDIDATES:
         try:
             raw = yf.download(cand, period="6mo", interval="1d", auto_adjust=False, progress=False)
@@ -1333,7 +1585,7 @@ def run_screener(universe: List[str], period: str = "1y",
             rows.append({
                 "Ticker": result["ticker_display"],
                 "Price": round(result["display_price"], 2),
-                "Price Src": "📍 PSX" if result["display_price_source"] == "psx_official_live" else "📅 yf",
+                "Price Src": _price_src_label(result),
                 "Change %": round(change_pct, 2), "Trend": result["trend"],
                 "Score": result["signal"]["score"], "Signal": result["signal"]["signal"],
                 "Gate": gate_label, "Confidence": conf,
@@ -1672,31 +1924,34 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.8</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.9</div>", unsafe_allow_html=True)
 
-st.sidebar.subheader("🔌 Provider Status")
-psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
-if psx_avail:
-    kse100_ok = "✅ verified" if PROVIDER_STATUS["psx_official"].get("kse100") else "⚠️ unverified"
-    st.sidebar.success(f"✅ PSX Official: Working ({kse100_ok})")
-else:
-    st.sidebar.error("❌ PSX Official: NOT WORKING")
-    psx_err = PROVIDER_STATUS.get("psx_official", {}).get("error")
-    if psx_err:
-        st.sidebar.caption(f"**Error:** {psx_err[:250]}")
-yf_avail = PROVIDER_STATUS.get("yfinance", {}).get("available", True)
-if yf_avail:
-    st.sidebar.success("✅ yfinance: Working (fallback)")
-else:
-    st.sidebar.error("❌ yfinance: Failed")
-    yf_err = PROVIDER_STATUS.get("yfinance", {}).get("error")
-    if yf_err:
-        st.sidebar.caption(f"**Error:** {yf_err[:250]}")
-psxd_avail = PROVIDER_STATUS.get("psxdata", {}).get("available", False)
-if psxd_avail:
-    st.sidebar.info("ℹ️ psxdata: Working (experimental)")
-else:
-    st.sidebar.caption("psxdata: Not installed (optional)")
+_prov_slot = st.sidebar.container()   # v8.9: filled at the END of the script, after all fetches
+
+def _render_provider_status():
+    st.subheader("🔌 Provider Status")
+    psx_avail = PROVIDER_STATUS.get("psx_official", {}).get("available", False)
+    if psx_avail:
+        kse100_ok = "✅ verified" if PROVIDER_STATUS["psx_official"].get("kse100") else "⚠️ unverified"
+        st.success(f"✅ PSX Official: Working ({kse100_ok})")
+    else:
+        st.error("❌ PSX Official: NOT WORKING")
+        psx_err = PROVIDER_STATUS.get("psx_official", {}).get("error")
+        if psx_err:
+            st.caption(f"**Error:** {psx_err[:250]}")
+    yf_avail = PROVIDER_STATUS.get("yfinance", {}).get("available", True)
+    if yf_avail:
+        st.success("✅ yfinance: Working (fallback)")
+    else:
+        st.error("❌ yfinance: Failed")
+        yf_err = PROVIDER_STATUS.get("yfinance", {}).get("error")
+        if yf_err:
+            st.caption(f"**Error:** {yf_err[:250]}")
+    psxd_avail = PROVIDER_STATUS.get("psxdata", {}).get("available", False)
+    if psxd_avail:
+        st.info("ℹ️ psxdata: Working (experimental)")
+    else:
+        st.caption("psxdata: Not installed (optional)")
 
 # v8.7 NEW: PSX Diagnostic button
 with st.sidebar.expander("🩺 PSX Diagnostic Probe"):
@@ -2194,7 +2449,7 @@ with tab_port:
                     active_stop = None
                 fresh_status, _, _ = get_freshness_status(result["data_date"])
                 data_date_str = result["data_date"].strftime("%Y-%m-%d") if result["data_date"] is not None else "N/A"
-                price_src = "📍 PSX" if result.get("display_price_source") == "psx_official_live" else "📅 yf"
+                price_src = _price_src_label(result)
                 conf = result.get("confidence", {}).get("level", "N/A")
                 rows.append({"Ticker": result["ticker_display"], "Buy": h["buy_price"],
                     "Shares": h["shares"], "Invested": round(invested, 2),
@@ -2425,3 +2680,6 @@ st.sidebar.caption("Data sourced from PSX Data Portal (dps.psx.com.pk) for perso
 # ============================================================
 # END
 # ============================================================
+
+with _prov_slot:          # v8.9: provider status reflects THIS run's fetches
+    _render_provider_status()
