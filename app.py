@@ -1,7 +1,22 @@
 """
-PSX QUANT ENGINE - v8.9
-========================
+PSX QUANT ENGINE - v8.9.1
+==========================
 PSX-focused quantitative decision-support terminal.
+
+CHANGELOG v8.9.1 (first live PSX diagnostic: token fix CONFIRMED on deployment):
+- FIX: the real /trading-board/REG/main table has NO "CURRENT" column
+  (SYMBOL, NAME, BID VOL., BID PRICE, OFFER VOL., OFFER PRICE, LDCP, CHANGE,
+  VOLUME). Current is now derived (LDCP + CHANGE, mode auto-detected abs vs %).
+  Before this the board was rejected ("Columns missing") -> no universe, no
+  live price.
+- FIX: live price is only labelled "live" when it really differs from the last
+  PSX close; otherwise it is shown as the PSX close (no false freshness).
+- FIX: labels said "Last yfinance close" / "using yfinance close" even when the
+  data came from PSX official - now source-aware. Confidence no longer
+  penalises official PSX data for lacking an intraday price.
+- NEW: scan universe sorted by traded volume (most liquid first).
+- NEW: KSE-100 chart marks the latest session (date + level).
+- NEW: probe prints the raw table header + first row HTML for ground truth.
 
 CHANGELOG v8.9  (root-cause fix for the PSX data outage):
 - ROOT CAUSE: since 2026-09-24 PSX rejects data requests with HTTP 403 unless
@@ -47,7 +62,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.9",
+    page_title="PSX Quant Engine v8.9.1",
     page_icon="📈",
     layout="wide"
 )
@@ -224,10 +239,11 @@ def calculate_confidence(result: Dict, freshness_status: str) -> Dict[str, Any]:
         score += 1; reasons.append("Data 2-3 business days old")
     else:
         score -= 3; reasons.append("Data STALE (>3 business days old)")
-    if result.get("display_price_source") == "psx_official_live":
+    if (result.get("display_price_source") == "psx_official_live"
+            or str(result.get("data_source", "")).startswith("psx_official")):
         score += 2
     else:
-        reasons.append("PSX live price unavailable (using yfinance close)")
+        reasons.append("PSX data unavailable (using yfinance close)")
     trend = result.get("trend", "")
     if trend in ("BULLISH", "STRONG BULLISH"): score += 2
     elif trend in ("BEARISH", "STRONG BEARISH"):
@@ -484,6 +500,20 @@ def diagnostic_psx_probe() -> str:
     try:
         r_tb = _psx_get(f"{PSX_BASE}/trading-board/REG/main", timeout=20, kind="html_xhr", use_breaker=False)
         _describe(r_tb, show_cols=True)
+        if r_tb is not None and r_tb.status_code == 200:
+            flat = re.sub(r"\s+", " ", r_tb.text)
+            ths = re.findall(r"<th[^>]*>(.*?)</th>", flat, flags=re.I)[:14]
+            L.append(f"- Raw header cells: `{[re.sub('<[^>]+>', '', x).strip() for x in ths]}`")
+            m1 = re.search(r"<tbody[^>]*>\s*(<tr.*?</tr>)", flat, flags=re.I)
+            if m1:
+                L.append(f"- Raw first row HTML: `{m1.group(1)[:700]}`")
+            bdf, berr = _parse_trading_board(r_tb.text)
+            if bdf is None:
+                L.append(f"- Parsed for app: ❌ {berr}")
+            else:
+                L.append(f"- Parsed for app: ✅ {len(bdf)} symbols · Current source: "
+                         f"`{bdf['Current_Src'].iloc[0]}` · top by volume: "
+                         f"`{bdf['Symbol'].head(5).tolist()}`")
     except Exception as e:
         L.append(f"- ❌ Exception: `{type(e).__name__}: {str(e)[:160]}`")
     L.append("")
@@ -593,9 +623,78 @@ def fetch_psx_official_index_json(index_symbol: str = "KSE100") -> Tuple[Optiona
                                diagnostic="Exception during parse")
         return None, "EXCEPTION", f"PSX EOD error: {msg}"
 
+def _board_change_mode(ldcp: pd.Series, chg: pd.Series) -> str:
+    """Is the board's CHANGE column absolute rupees ('abs') or percent ('pct')?
+    PSX caps daily moves at ~7.5%, so an absolute change never exceeds ~8% of LDCP.
+    Cheap stocks (LDCP <= 100) separate the two cases: a percent value like 2.3 is far
+    larger than 8% of a PKR 10 price. Header says CHANGE (not CHANGE %) so 'abs' is the default."""
+    m = (ldcp > 0) & chg.notna() & (chg != 0)
+    within = chg.abs() <= 0.08 * ldcp + 0.011
+    cheap = m & (ldcp <= 100)
+    if int(cheap.sum()) >= 8:
+        return "abs" if within[cheap].mean() >= 0.85 else "pct"
+    if int(m.sum()) >= 5 and within[m].mean() < 0.9:
+        return "pct"
+    return "abs"
+
+def _parse_trading_board(html: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    df = _first_table(html)
+    if df is None or df.empty:
+        return None, "HTTP 200 but no table parsed from trading-board HTML"
+    rename_map = {}
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if "symbol" in cl:                 rename_map[c] = "Symbol"
+        elif "sector" in cl:               rename_map[c] = "Sector"
+        elif "listed" in cl:               rename_map[c] = "Listed_In"
+        elif "ldcp" in cl:                 rename_map[c] = "LDCP"
+        elif cl == "open":                 rename_map[c] = "Open"
+        elif cl == "high":                 rename_map[c] = "High"
+        elif cl == "low":                  rename_map[c] = "Low"
+        elif "current" in cl:              rename_map[c] = "Current"
+        elif "change" in cl and "%" in cl: rename_map[c] = "Change_Pct"
+        elif "change" in cl:               rename_map[c] = "Change"
+        elif "volume" in cl and "bid" not in cl and "offer" not in cl: rename_map[c] = "Volume"
+    df = df.rename(columns=rename_map)
+    if "Symbol" not in df.columns:
+        return None, f"No Symbol column: {[str(c) for c in df.columns][:9]}"
+    for col in ["LDCP", "Open", "High", "Low", "Current", "Change", "Change_Pct", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "")
+                                    .str.replace("%", "").str.strip(), errors="coerce")
+    if "Current" in df.columns:
+        df["Current_Src"] = "board"
+    elif "LDCP" in df.columns:
+        # v8.9.1: the real board has LDCP + CHANGE but no CURRENT column
+        if "Change" in df.columns:
+            mode = _board_change_mode(df["LDCP"], df["Change"])
+            if mode == "abs":
+                df["Current"] = df["LDCP"] + df["Change"].fillna(0)
+                df["Current_Src"] = "LDCP+CHANGE"
+            else:
+                df["Current"] = df["LDCP"] * (1 + df["Change"].fillna(0) / 100.0)
+                df["Current_Src"] = "LDCP*(1+CHANGE%)"
+        elif "Change_Pct" in df.columns:
+            df["Current"] = df["LDCP"] * (1 + df["Change_Pct"].fillna(0) / 100.0)
+            df["Current_Src"] = "LDCP*(1+CHANGE%)"
+        else:
+            df["Current"] = df["LDCP"]
+            df["Current_Src"] = "LDCP"
+    else:
+        return None, f"Columns missing (no CURRENT/LDCP): {[str(c) for c in df.columns][:9]}"
+    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+    df = df[df["Symbol"].str.fullmatch(r"[A-Z0-9&-]{2,15}")]
+    df = df[df["Current"].notna() & (df["Current"] > 0)]
+    df = df.drop_duplicates(subset="Symbol", keep="first")
+    if "Volume" in df.columns:    # most liquid first (stable; keeps order if all equal)
+        df = df.sort_values("Volume", ascending=False, kind="mergesort", na_position="last")
+    if df.empty:
+        return None, "Trading board parsed but no valid symbol rows"
+    return df.reset_index(drop=True), None
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]:
-    """v8.9: live snapshot of all symbols from /trading-board/REG/main
+    """Live snapshot of all symbols from /trading-board/REG/main
     (the old /market-watch page returns 404 since the PSX site change)."""
     url = f"{PSX_BASE}/trading-board/REG/main"
     try:
@@ -611,41 +710,10 @@ def fetch_psx_official_market_watch() -> Tuple[Optional[pd.DataFrame], str, str]
             update_provider_status("psx_official", available=False, error=msg,
                                    diagnostic=f"Status {resp.status_code} on {url}")
             return None, "EMPTY", msg
-        df = _first_table(resp.text)
-        if df is None or df.empty:
-            msg = "HTTP 200 but no table parsed from trading-board HTML"
-            update_provider_status("psx_official", available=False, error=msg)
-            return None, "EMPTY", msg
-        rename_map = {}
-        for c in df.columns:
-            cl = str(c).strip().lower()
-            if "symbol" in cl:                 rename_map[c] = "Symbol"
-            elif "sector" in cl:               rename_map[c] = "Sector"
-            elif "listed" in cl:               rename_map[c] = "Listed_In"
-            elif "ldcp" in cl:                 rename_map[c] = "LDCP"
-            elif cl == "open":                 rename_map[c] = "Open"
-            elif cl == "high":                 rename_map[c] = "High"
-            elif cl == "low":                  rename_map[c] = "Low"
-            elif "current" in cl:              rename_map[c] = "Current"
-            elif "change" in cl and "%" in cl: rename_map[c] = "Change_Pct"
-            elif "change" in cl:               rename_map[c] = "Change"
-            elif "volume" in cl:               rename_map[c] = "Volume"
-        df = df.rename(columns=rename_map)
-        if "Symbol" not in df.columns or "Current" not in df.columns:
-            msg = f"Columns missing: {[str(c) for c in df.columns][:9]}"
-            update_provider_status("psx_official", available=False, error=msg)
-            return None, "EXCEPTION", msg
-        for col in ["LDCP", "Open", "High", "Low", "Current", "Change", "Change_Pct", "Volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "")
-                                        .str.replace("%", "").str.strip(), errors="coerce")
-        df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-        df = df[df["Symbol"].str.fullmatch(r"[A-Z0-9&-]{2,15}")].dropna(subset=["Current"])
-        df = df.drop_duplicates(subset="Symbol", keep="first")
-        if df.empty:
-            msg = "Trading board parsed but no valid symbol rows"
-            update_provider_status("psx_official", available=False, error=msg)
-            return None, "EMPTY", msg
+        df, err = _parse_trading_board(resp.text)
+        if df is None:
+            update_provider_status("psx_official", available=False, error=err)
+            return None, "EXCEPTION", err
         update_provider_status("psx_official", available=True, coverage=len(df), diagnostic=None)
         return df, "SUCCESS", None
     except Exception as e:
@@ -676,7 +744,7 @@ def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) 
         psx_price = float(row.iloc[0]["Current"])
         if yf_reference_price is not None and yf_reference_price > 0:
             ratio = psx_price / yf_reference_price
-            if ratio > 10.0 or ratio < 0.1:
+            if ratio > 1.20 or ratio < 0.80:     # >20% off the last close = mis-parse, not a price
                 return None
         return {"price": psx_price, "date": pkt_now().date(), "source": "psx_official_live"}
     except Exception:
@@ -693,8 +761,8 @@ def get_scan_universe() -> Tuple[List[str], str]:
         symbols = mw["Symbol"].dropna().unique().tolist()
         formatted = [s + ".KA" if not s.endswith(".KA") else s for s in symbols]
         uniq = list(dict.fromkeys(formatted))
-        return uniq, f"PSX official market-watch ({len(uniq)} symbols)"
-    return PSX_FALLBACK_UNIVERSE, f"curated fallback ({len(PSX_FALLBACK_UNIVERSE)}) — market-watch unavailable"
+        return uniq, f"PSX official trading board ({len(uniq)} symbols, by volume)"
+    return PSX_FALLBACK_UNIVERSE, f"curated fallback ({len(PSX_FALLBACK_UNIVERSE)}) — PSX trading board unavailable"
 
 # ============================================================
 # OHLCV PROVIDERS
@@ -1510,14 +1578,16 @@ def analyze_stock(ticker: str, period: str = "1y",
         "cap_size": cap_size, "data_source": source, "avg_volume": avg_volume,
         "reconciliation": reconcile_psx_vs_yf(ticker, df),
     }
-    live = get_live_psx_price(ticker, yf_reference_price=float(last["Close"]))
-    if live is not None:
+    last_close = float(last["Close"])
+    live = get_live_psx_price(ticker, yf_reference_price=last_close)
+    # only call it "live" when it genuinely differs from the last close (no false freshness)
+    if live is not None and abs(live["price"] - last_close) > max(0.015, 0.0005 * last_close):
         result["display_price"] = live["price"]
         result["display_price_source"] = "psx_official_live"
         result["display_price_date"] = live["date"]
     else:
-        result["display_price"] = float(last["Close"])
-        result["display_price_source"] = "yfinance_historical"
+        result["display_price"] = last_close
+        result["display_price_source"] = "last_close"
         result["display_price_date"] = result["data_date"]
     fresh_status, _, _ = get_freshness_status(result["data_date"])
     result["confidence"] = calculate_confidence(result, fresh_status)
@@ -1924,7 +1994,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.9</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.9.1</div>", unsafe_allow_html=True)
 
 _prov_slot = st.sidebar.container()   # v8.9: filled at the END of the script, after all fetches
 
@@ -1988,8 +2058,8 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
         st.session_state.pop(k, None)
     st.sidebar.success("Cache cleared!")
 
-st.sidebar.caption("KSE-100: PSX Official → yfinance | Stock OHLCV: psxdata → yfinance")
-st.sidebar.caption("Market-watch: PSX Official HTML | Live price: PSX → yfinance close")
+st.sidebar.caption("KSE-100: PSX Official → yfinance | Stock OHLCV: PSX /historical → yfinance")
+st.sidebar.caption("Board: PSX trading-board (token) | Price: PSX live → last PSX close → yfinance")
 st.sidebar.caption("Confidence: data quality + signal reliability marker")
 st.sidebar.caption("Cache: 5min | Universe: 60min")
 st.sidebar.caption(f"Checked: {pkt_now().strftime('%d-%b %H:%M')} PKT")
@@ -2052,6 +2122,8 @@ with tab_dash:
             st.caption(f"Data: {source} · {freshness_status} · {result['data_date'].date()}")
             if result["display_price_source"] == "psx_official_live":
                 st.caption(f"📍 Live PSX price (aaj) · {result['display_price_date']}")
+            elif str(result.get("data_source", "")).startswith("psx_official"):
+                st.caption(f"📅 Last PSX close · {result['data_date'].date()}")
             else:
                 st.caption(f"📅 Last yfinance close · {result['display_price_date']}")
         with col2:
@@ -2551,9 +2623,15 @@ with tab_market:
                 line=dict(color="#F59E0B", width=1.5, dash="dot"), name="SMA20"))
             fig.add_trace(go.Scatter(x=idx_disp.index, y=idx_disp["SMA50"],
                 line=dict(color="#8B5CF6", width=1.5, dash="dot"), name="SMA50"))
+            _lx, _ly = idx_disp.index[-1], float(idx_disp["Close"].iloc[-1])
+            fig.add_trace(go.Scatter(x=[_lx], y=[_ly], mode="markers",
+                marker=dict(color="#EF4444", size=9), name="Latest", showlegend=False))
+            fig.add_annotation(x=_lx, y=_ly, text=f"{_lx:%d-%b-%Y}: {_ly:,.1f}",
+                showarrow=True, arrowhead=2, ax=-70, ay=-40, bgcolor="#FFFFFF",
+                bordercolor="#EF4444", font=dict(size=11))
             fig.update_layout(template="plotly_white", height=400,
                 margin=dict(l=10, r=10, t=30, b=10),
-                title=dict(text=f"KSE-100 — last {len(idx_disp)} sessions",
+                title=dict(text=f"KSE-100 — last {len(idx_disp)} sessions · latest {_lx:%d-%b-%Y}",
                            font=dict(size=13)))
             st.plotly_chart(fig, use_container_width=True)
     st.divider()
