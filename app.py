@@ -1,7 +1,21 @@
 """
-PSX QUANT ENGINE - v8.9.1
+PSX QUANT ENGINE - v8.9.2
 ==========================
 PSX-focused quantitative decision-support terminal.
+
+CHANGELOG v8.9.2 (live-data review, all from real screenshots):
+- STOP LOSS REDESIGN: stop was min(10d swing low, 20d support) - 0.3 ATR, i.e. the
+  FARTHEST level, giving stops 25-36% below entry (PRL 106.95 -> 80.39) and R:R ~0.5
+  everywhere, which is why almost every stock hit the R:R-gate. Now: nearest real
+  support, kept between 1.0 and 2.5 ATR (1.5 ATR if support is closer than 1 ATR) and never more than 10% below entry.
+  "Risk %" (entry->stop) is shown in every table and on the Dashboard.
+- FIX: Top Picks "Day Trade" listed stocks with status "NO BREAKOUT" (substring match).
+- FIX: Pullbacks tab listed "NO PULLBACK" rows (same substring bug); now only real
+  pullbacks, plus an "approaching" list (bullish, <= 8% above EMA20).
+- NEW: failed symbols in a scan now show the real reason (expander).
+- NEW: Breakouts hides penny stocks by default (checkbox), shows Penny column.
+- FIX: metric cards broke words mid-word ("MINIMU M").
+- FIX: Portfolio table crashed Streamlit's Arrow converter when a stop column mixed numbers and "N/A".
 
 CHANGELOG v8.9.1 (first live PSX diagnostic: token fix CONFIRMED on deployment):
 - FIX: the real /trading-board/REG/main table has NO "CURRENT" column
@@ -62,7 +76,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.9.1",
+    page_title="PSX Quant Engine v8.9.2",
     page_icon="📈",
     layout="wide"
 )
@@ -77,7 +91,7 @@ st.markdown("""
 h1, h2, h3, h4 { font-family: 'Inter', 'Segoe UI', sans-serif !important; font-weight: 600 !important; color: #16213E !important; }
 [data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04); }
 [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * { color: #64748B !important; font-size: 0.72rem !important; font-weight: 500 !important; text-transform: uppercase !important; letter-spacing: 0.6px !important; }
-[data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: #0F172A !important; font-family: 'Inter', 'Segoe UI', sans-serif !important; font-size: 1.5rem !important; font-weight: 700 !important; white-space: normal !important; overflow-wrap: anywhere !important; }
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: #0F172A !important; font-family: 'Inter', 'Segoe UI', sans-serif !important; font-size: 1.5rem !important; font-weight: 700 !important; white-space: normal !important; overflow-wrap: break-word !important; word-break: normal !important; }
 section[data-testid="stSidebar"] { background-color: #FFFFFF !important; border-right: 1px solid #E2E8F0 !important; }
 section[data-testid="stSidebar"] * { color: #1E293B !important; }
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *, .stCaption, .stCaption * { color: #64748B !important; font-size: 0.8rem !important; }
@@ -107,6 +121,9 @@ h2, h3 { margin-top: 0.5rem !important; }
 # ============================================================
 
 MIN_RR = 1.5
+STOP_MIN_ATR = 1.0     # stop is never tighter than 1.0 ATR below entry (market noise)
+STOP_MAX_ATR = 2.5     # ... and never further than 2.5 ATR
+STOP_MAX_PCT = 0.10    # ... nor more than 10% below entry (PSX daily limit is ~10%)
 DAY_TRADE_MIN_RR = 1.0
 PENNY_STOCK_THRESHOLD = 50
 MIN_HISTORY_DAYS = 60
@@ -121,9 +138,9 @@ KSE100_CANDIDATES = ["^KSE100", "KSE100.KA"]
 
 SCREENER_COLUMNS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score",
                     "Signal", "Gate", "Confidence", "Status", "Penny", "RR", "RR Flag",
-                    "Entry", "Stop Loss", "Target 1",
+                    "Entry", "Stop Loss", "Risk %", "Target 1",
                     "Cap Size", "Source", "Why", "Avg Volume",
-                    "RVOL", "Pullback", "Momentum", "Resistance", "Dist %", "52W",
+                    "RVOL", "Pullback", "Momentum", "Resistance", "Dist %", "52W", "Risk %", "EMA20", "Above EMA20 %",
                     "_ticker_raw"]
 
 # ============================================================
@@ -1331,12 +1348,26 @@ def risk_engine(d, sr, breakout_status=""):
         return {"entry": None, "stop_loss": None, "risk_per_share": None, "target1": None,
                 "target2": None, "rr1": None, "rr2": None, "conditional_entry": None,
                 "conditional_entry_note": "Invalid price", "error": "Invalid entry price"}
-    if "EXTENDED BREAKOUT" in breakout_status:
-        tighter_stop = price - (2.5 * atr_val)
-        stop_loss = max(tighter_stop, sr["primary_support"])
+    # v8.9.2: nearest meaningful support, kept within [1.0, 2.5] ATR and <= 10% of entry.
+    # (Old logic took min(swing low, 20d support) = the FARTHEST level -> 25-36% stops.)
+    swing_low = d.tail(10)["Low"].min()
+    buffer = 0.3 * atr_val
+    levels = [swing_low - buffer, sr["primary_support"] - buffer]
+    room = STOP_MIN_ATR * atr_val
+    valid = [lv for lv in levels if lv <= price - room and lv < price]
+    if atr_val > 0:
+        structure = max(valid) if valid else price - 1.5 * atr_val
+        floor = max(price - STOP_MAX_ATR * atr_val, price * (1 - STOP_MAX_PCT))
     else:
-        swing_low = d.tail(10)["Low"].min()
-        stop_loss = min(swing_low, sr["primary_support"]) - 0.3 * atr_val
+        structure = max(valid) if valid else price * 0.95
+        floor = price * (1 - STOP_MAX_PCT)
+    stop_loss = max(structure, floor)
+    if structure >= floor:
+        stop_basis = "support (nearest)"
+    elif atr_val > 0 and price - STOP_MAX_ATR * atr_val >= price * (1 - STOP_MAX_PCT):
+        stop_basis = f"{STOP_MAX_ATR:g} ATR cap"
+    else:
+        stop_basis = f"{int(STOP_MAX_PCT * 100)}% cap"
     if stop_loss is None or stop_loss >= price:
         return {"entry": price, "stop_loss": None, "risk_per_share": None, "target1": None,
                 "target2": None, "rr1": None, "rr2": None, "conditional_entry": None,
@@ -1370,7 +1401,9 @@ def risk_engine(d, sr, breakout_status=""):
     return {"entry": price, "stop_loss": stop_loss, "risk_per_share": risk_per_share,
             "target1": target1, "target2": target2, "rr1": rr1, "rr2": rr2,
             "conditional_entry": conditional_entry,
-            "conditional_entry_note": conditional_entry_note, "error": None}
+            "conditional_entry_note": conditional_entry_note, "error": None,
+            "risk_pct": round(risk_per_share / price * 100, 1) if price > 0 else None,
+            "stop_basis": stop_basis}
 
 # ============================================================
 # SCORING & SIGNAL
@@ -1621,7 +1654,8 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Signal": "ERROR", "Gate": "n/a", "Confidence": "N/A",
                 "Status": "DATA UNAVAILABLE", "Penny": None, "RR": None, "RR Flag": "",
                 "Entry": None, "Stop Loss": None, "Target 1": None,
-                "Cap Size": None, "Source": source, "Why": "Data unavailable",
+                "Cap Size": None, "Source": source,
+                "Why": f"Data unavailable: {str(error)[:170]}",
                 "Avg Volume": None, "_ticker_raw": ticker})
             continue
         coverage["success"] += 1
@@ -1668,6 +1702,10 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Target 1": round(result["risk"]["target1"], 2) if result["risk"].get("target1") else None,
                 "Cap Size": result["cap_size"], "Source": result["data_source"],
                 "Why": why_text, "Avg Volume": round(avg_volume, 0),
+                "Risk %": result["risk"].get("risk_pct"),
+                "EMA20": round(float(last["EMA20"]), 2) if not pd.isna(last["EMA20"]) else None,
+                "Above EMA20 %": round((float(last["Close"]) / float(last["EMA20"]) - 1) * 100, 1)
+                                 if not pd.isna(last["EMA20"]) and last["EMA20"] > 0 else None,
                 "RVOL": round(float(last["VOL_RATIO"]), 2) if not pd.isna(last["VOL_RATIO"]) else None,
                 "Pullback": result["pullback"]["status"],
                 "Momentum": result["momentum"]["label"],
@@ -1729,7 +1767,10 @@ def categorize_top_picks(screener_df: pd.DataFrame,
         if col not in df.columns:
             df[col] = None
 
-    day_mask = (df["Status"].astype(str).str.contains("BREAKOUT|READY|ATTEMPT", case=False, na=False)
+    _st = df["Status"].astype(str)
+    day_mask = (_st.str.contains("BREAKOUT|READY|ATTEMPT", case=False, na=False)
+                & ~_st.str.upper().str.startswith("NO BREAKOUT")        # v8.9.2: was matching "NO BREAKOUT"
+                & ~_st.str.contains("UNAVAILABLE|ERROR", case=False, na=False)
                 & (pd.to_numeric(df["Score"], errors="coerce").fillna(0) >= 55))
     day_df = df[day_mask].copy()
     if not day_df.empty:
@@ -1994,7 +2035,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.9.1</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v8.9.2</div>", unsafe_allow_html=True)
 
 _prov_slot = st.sidebar.container()   # v8.9: filled at the END of the script, after all fetches
 
@@ -2176,6 +2217,8 @@ with tab_dash:
             c3.metric("Target 1", round(risk["target1"], 2))
             c4.metric("Target 2", round(risk["target2"], 2))
             c5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
+            st.caption(f"🛑 Stop {risk.get('risk_pct', '?')}% neeche (entry se) · basis: {risk.get('stop_basis', '?')} · "
+                       f"limits: {STOP_MIN_ATR:g}–{STOP_MAX_ATR:g} ATR, max {int(STOP_MAX_PCT*100)}%")
             if risk.get("conditional_entry") is not None:
                 st.caption(f"💡 Better Entry: {risk['conditional_entry']} — {risk['conditional_entry_note']}")
 
@@ -2329,6 +2372,13 @@ with tab_screener:
         c3.metric("Success", cov["success"]); c4.metric("Failed", cov["failed"])
         if "screener_universe_source" in st.session_state:
             st.caption(f"Universe source: {st.session_state['screener_universe_source']}")
+        if cov.get("failed", 0) > 0 and "screener_df" in st.session_state:
+            _fd = st.session_state["screener_df"]
+            if "Signal" in _fd.columns and "Why" in _fd.columns:
+                _fd = _fd[_fd["Signal"] == "ERROR"]
+                if not _fd.empty:
+                    with st.expander(f"⚠️ Failed symbols ({len(_fd)}) — wajah"):
+                        st.dataframe(_fd[["Ticker", "Why"]], use_container_width=True, hide_index=True)
 
     if "screener_df" in st.session_state:
         df_s = st.session_state["screener_df"]
@@ -2388,10 +2438,30 @@ with tab_screener:
 
 BREAKOUT_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
                  "Gate", "Confidence", "Status", "RVOL", "Resistance", "Dist %",
-                 "Entry", "Stop Loss", "Target 1", "RR", "RR Flag", "Momentum", "52W", "Why"]
+                 "Entry", "Stop Loss", "Risk %", "Target 1", "RR", "RR Flag", "Penny", "Momentum", "52W", "Why"]
 PULLBACK_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
-                 "Gate", "Confidence", "Pullback", "Entry", "Stop Loss", "Target 1",
-                 "RR", "RR Flag", "RVOL", "Momentum", "Why"]
+                 "Gate", "Confidence", "Pullback", "EMA20", "Above EMA20 %", "Entry", "Stop Loss",
+                 "Risk %", "Target 1", "RR", "RR Flag", "RVOL", "Momentum", "Why"]
+
+def _arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Columns mixing numbers and text (e.g. 'N/A') break st.dataframe's Arrow conversion."""
+    df = df.copy()
+    for c in df.columns:
+        col = df[c]
+        if col.dtype == object:
+            vals = [v for v in col if v is not None and not (isinstance(v, float) and pd.isna(v))]
+            has_str = any(isinstance(v, str) for v in vals)
+            has_num = any(isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool) for v in vals)
+            if has_str and has_num:
+                df[c] = col.map(lambda v: "N/A" if v is None or (isinstance(v, float) and pd.isna(v))
+                                else (f"{v:.2f}" if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                                      else str(v)))
+    return df
+
+def _is_penny_row(df: pd.DataFrame) -> pd.Series:
+    if "Penny" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["Penny"].notna() & (df["Penny"] != "N/A")
 
 with tab_breakouts:
     st.subheader("🚀 Breakouts")
@@ -2405,7 +2475,7 @@ with tab_breakouts:
         if df_s.empty or not needed.issubset(df_s.columns):
             st.info("Screener output purana/khali hai — dobara Run Screener chalao.")
         else:
-            c1, c2 = st.columns([2, 1])
+            c1, c2, c3 = st.columns([2, 1, 1])
             with c1:
                 bo_mode = st.radio("Breakout type",
                     ["Confirmed / 52W breakout", "Near breakout + volume", "Sab (confirmed + near)"],
@@ -2414,7 +2484,12 @@ with tab_breakouts:
                 bo_rvol = st.number_input("Min RVOL", min_value=0.0, max_value=20.0,
                     value=2.0, step=0.5, key="bo_rvol",
                     help="Relative volume: aaj ka volume / 20-din average. 2.0 = double.")
+            with c3:
+                bo_penny = st.checkbox("Penny stocks bhi", value=False, key="bo_penny",
+                    help="PKR 50 se sasti stocks mein false breakouts zyada hote hain.")
             work = df_s[df_s["Signal"] != "ERROR"].copy()
+            if not bo_penny:
+                work = work[~_is_penny_row(work)]
             status_s = work["Status"].astype(str)
             rvol_s = pd.to_numeric(work["RVOL"], errors="coerce").fillna(0)
             confirmed = status_s.str.contains("CONFIRMED", case=False, na=False) | \
@@ -2434,39 +2509,58 @@ with tab_breakouts:
                 st.dataframe(bo.sort_values("RVOL", ascending=False)[cols],
                              use_container_width=True, hide_index=True)
                 st.caption("Volume ke bina breakout aksar jhootha hota hai (false breakout) — "
-                           "RVOL aur RR Flag dono dekho. Entry/Stop/Target technical levels hain.")
+                           "RVOL, Risk % aur RR Flag dekho. Entry/Stop/Target technical levels hain.")
 
 # ============================================================
-# PULLBACKS TAB (v8.8 NEW: swing entries near support / EMA20 in an uptrend)
+# PULLBACKS TAB (swing entries near support / EMA20 in an uptrend)
 # ============================================================
 
 with tab_pull:
     st.subheader("🔁 Pullbacks (Swing Entries)")
-    st.caption("Bullish trend wale stocks jo support ya EMA20 ke qareeb wapas aaye hain. "
+    st.caption("Bullish trend wale stocks jo EMA20 ya support ke qareeb wapas aaye hain. "
                "Breakout ka ulta idea: tez bhaag chuke stock ko chase karne ke bajaye dip pe entry.")
+    with st.expander("ℹ️ Pullback kya hota hai? (parhne ke liye)"):
+        st.markdown(
+            "- **Pullback** = uptrend ke beech mein chhota sa girna (dip), jahan se trend dobara chal sakta hai.\n"
+            "- System isay tab pakadta hai jab: trend BULLISH ho, price **EMA20 ya support ke 2-3% ke andar** ho, "
+            "RSI thanda ho kar **35-55** mein aaye, aur aaj ki candle **upar band** ho (HEALTHY).\n"
+            "- **PULLBACK WATCH** = zone ke andar hai lekin RSI/candle ki confirmation baqi hai.\n"
+            "- Jo stock EMA20 se bohot upar hai (RSI 70+) wo **abhi pullback mein nahi** hai — usay chase karne "
+            "ke bajaye neeche 'Approaching' list mein dekho aur dip ka intezar karo.\n"
+            "- Stop Loss ke neeche close ho to setup khatam. Risk % se dekho ke stop kitna door hai.")
     if "screener_df" not in st.session_state:
         st.info("Pehle Screener tab pe 'Run Screener' chalao.")
     else:
         df_s = st.session_state["screener_df"]
-        if df_s.empty or "Pullback" not in df_s.columns:
+        if df_s.empty or not {"Pullback", "Above EMA20 %"}.issubset(df_s.columns):
             st.info("Screener output purana/khali hai — dobara Run Screener chalao.")
         else:
             only_healthy = st.checkbox("Sirf HEALTHY PULLBACK (confirmation ke saath)", value=False,
                                        key="pb_healthy")
             work = df_s[df_s["Signal"] != "ERROR"].copy()
-            pb_s = work["Pullback"].astype(str)
-            mask = pb_s.str.contains("HEALTHY") if only_healthy else pb_s.str.contains("PULLBACK")
-            mask &= work["Trend"].isin(["BULLISH", "STRONG BULLISH"])
-            pb = work[mask]
+            work = work[~_is_penny_row(work)]
+            pb_s = work["Pullback"].astype(str).str.strip().str.upper()
+            bull = work["Trend"].isin(["BULLISH", "STRONG BULLISH"])
+            wanted = ["HEALTHY PULLBACK"] if only_healthy else ["HEALTHY PULLBACK", "PULLBACK WATCH"]
+            pb = work[pb_s.isin(wanted) & bull]
+            st.markdown("**✅ Abhi pullback zone mein**")
             if pb.empty:
-                st.info("Abhi koi pullback setup nahi mila. Bearish/sideways market mein yeh normal hai.")
+                st.info("Abhi koi stock pullback zone mein nahi hai. Bearish/sideways market mein yeh normal hai.")
             else:
                 cols = [c for c in PULLBACK_COLS if c in pb.columns]
                 st.dataframe(pb.sort_values("Score", ascending=False)[cols],
                              use_container_width=True, hide_index=True)
-                st.caption("HEALTHY PULLBACK = support/EMA20 ke paas + RSI 35-55 + bullish candle. "
-                           "PULLBACK WATCH = qareeb hai lekin confirmation baqi. "
-                           "Stop Loss ke neeche close ho to setup khatam.")
+            ab_x = pd.to_numeric(work["Above EMA20 %"], errors="coerce")
+            appr = work[(pb_s == "NO PULLBACK") & bull & (ab_x > 2) & (ab_x <= 8)]
+            st.markdown("**👀 Approaching — bullish, EMA20 se 2-8% upar (dip ka intezar)**")
+            if appr.empty:
+                st.caption("Koi stock is range mein nahi.")
+            else:
+                cols = [c for c in PULLBACK_COLS if c in appr.columns]
+                st.dataframe(appr.assign(_x=ab_x[appr.index]).sort_values("_x")[cols],
+                             use_container_width=True, hide_index=True)
+            st.caption("EMA20 = pullback ka nishana (isi ke paas entry dekhi jati hai). "
+                       "Entry/Stop/Target technical levels hain, guarantee nahi.")
 
 # ============================================================
 # PORTFOLIO TAB
@@ -2566,7 +2660,7 @@ with tab_port:
             c2.metric("Current", f"PKR {round(total_current, 2)}")
             c3.metric("P/L", f"PKR {round(total_pnl, 2)}")
             c4.metric("P/L %", f"{round(total_pnl_pct, 2)}%")
-        port_df = pd.DataFrame(rows)
+        port_df = _arrow_safe(pd.DataFrame(rows))
         try:
             styled = port_df.style.apply(_style_portfolio_row, axis=1)
             st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -2714,7 +2808,7 @@ with tab_top:
             else:
                 day_cols = ["Ticker", "Price", "Price Src", "Change %", "Score", "Signal",
                             "Gate", "Confidence", "Status",
-                            "Entry", "Stop Loss", "Target 1",
+                            "Entry", "Stop Loss", "Risk %", "Target 1",
                             "RR", "RR Flag", "Hold Estimate", "Basis"]
                 day_cols = [c for c in day_cols if c in picks["day"].columns]
                 st.dataframe(picks["day"][day_cols], use_container_width=True, hide_index=True)
@@ -2726,7 +2820,7 @@ with tab_top:
             else:
                 swing_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
                               "Gate", "Confidence", "Status",
-                              "Entry", "Stop Loss", "Target 1",
+                              "Entry", "Stop Loss", "Risk %", "Target 1",
                               "RR", "Hold Estimate", "Basis"]
                 swing_cols = [c for c in swing_cols if c in picks["swing"].columns]
                 st.dataframe(picks["swing"][swing_cols], use_container_width=True, hide_index=True)
@@ -2738,7 +2832,7 @@ with tab_top:
             else:
                 hold_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
                              "Gate", "Confidence", "Status",
-                             "Entry", "Stop Loss", "Target 1",
+                             "Entry", "Stop Loss", "Risk %", "Target 1",
                              "RR", "Hold Estimate", "Basis"]
                 hold_cols = [c for c in hold_cols if c in picks["hold"].columns]
                 st.dataframe(picks["hold"][hold_cols], use_container_width=True, hide_index=True)
