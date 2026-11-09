@@ -1,7 +1,24 @@
 """
-PSX QUANT ENGINE - v8.9.2
+PSX QUANT ENGINE - v9.0
 ==========================
 PSX-focused quantitative decision-support terminal.
+
+CHANGELOG v9.0 (live-screenshot review, phase 2):
+- STOP LOSS: user-controlled "Max Stop Loss %" slider (2-10%, default 5%). Stop = nearest
+  real support inside that cap, else 1.5 ATR, else the cap. "Stop ATR" column + "tight stop"
+  flag warn when the stop is tighter than one normal daily move (whipsaw risk).
+- BUY ZONES: every plan now has "Buy on Dip" (downside zone) and "Buy on Breakout" (upside trigger)
+  ranges with R:R computed AT the zone, so "WAIT" explains where entry becomes attractive.
+- SUPPORT / RESISTANCE: swing-pivot clustering (touches counted) replaces raw 20-day high/low;
+  chart draws shaded zones, fewer lines, weekend/holiday gaps removed, bars selector,
+  vibrant candles. Legacy 20d range kept as range_high20 / range_low20.
+- WAIT clarity: "WAIT kyun" reason on top of Why-this-signal (R:R gate explained with numbers).
+- PULLBACKS: "Pullback Checks" (Trend / Zone / RSI / Candle) + Action column.
+- PORTFOLIO: break-even %, technical projection, and a Recovery Planner per losing holding
+  (levels to reclaim, trend-repair checklist, volatility-based time scale, rupee outcomes of
+  exit/hold/reduce, averaging math, switch math vs. current screener candidates).
+- TOP PICKS: a stock appears in one category only (Hold > Swing > Day).
+- Dashboard: bearish stocks explain that this tool is long-only (no short setup).
 
 CHANGELOG v8.9.2 (live-data review, all from real screenshots):
 - STOP LOSS REDESIGN: stop was min(10d swing low, 20d support) - 0.3 ATR, i.e. the
@@ -76,7 +93,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v8.9.2",
+    page_title="PSX Quant Engine v9.0",
     page_icon="📈",
     layout="wide"
 )
@@ -123,7 +140,8 @@ h2, h3 { margin-top: 0.5rem !important; }
 MIN_RR = 1.5
 STOP_MIN_ATR = 1.0     # stop is never tighter than 1.0 ATR below entry (market noise)
 STOP_MAX_ATR = 2.5     # ... and never further than 2.5 ATR
-STOP_MAX_PCT = 0.10    # ... nor more than 10% below entry (PSX daily limit is ~10%)
+STOP_MAX_PCT = 0.10    # HARD ceiling: never more than 10% below entry (PSX daily limit is ~10%)
+DEFAULT_STOP_PCT = 0.05  # default user cap (sidebar slider overrides)
 DAY_TRADE_MIN_RR = 1.0
 PENNY_STOCK_THRESHOLD = 50
 MIN_HISTORY_DAYS = 60
@@ -138,10 +156,11 @@ KSE100_CANDIDATES = ["^KSE100", "KSE100.KA"]
 
 SCREENER_COLUMNS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score",
                     "Signal", "Gate", "Confidence", "Status", "Penny", "RR", "RR Flag",
-                    "Entry", "Stop Loss", "Risk %", "Target 1",
+                    "Entry", "Stop Loss", "Risk %", "Stop ATR", "Target 1",
+                    "Buy on Dip", "RR @Dip", "Buy on Breakout",
                     "Cap Size", "Source", "Why", "Avg Volume",
-                    "RVOL", "Pullback", "Momentum", "Resistance", "Dist %", "52W", "Risk %", "EMA20", "Above EMA20 %",
-                    "_ticker_raw"]
+                    "RVOL", "Pullback", "Pullback Checks", "RSI", "Momentum", "Resistance", "Dist %", "52W",
+                    "EMA20", "Above EMA20 %", "_ticker_raw"]
 
 # ============================================================
 # PSX UNIVERSE (Fallback only)
@@ -772,13 +791,19 @@ def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) 
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
+# ex-dividend / non-convertible / rights lines (e.g. HUMNLXD, PASLNC, BAPLR1): no /historical table on PSX
+_DERIVED_SYMBOL_RE = re.compile(r"^[A-Z]{3,}(XD|NC|NCXD)$|^[A-Z]{3,}R\d+$")
+
 def get_scan_universe() -> Tuple[List[str], str]:
     mw, status, _ = fetch_psx_official_market_watch()
     if status == "SUCCESS" and mw is not None and len(mw) > 100:
         symbols = mw["Symbol"].dropna().unique().tolist()
-        formatted = [s + ".KA" if not s.endswith(".KA") else s for s in symbols]
+        kept = [s for s in symbols if not _DERIVED_SYMBOL_RE.search(str(s).upper().replace(".KA", ""))]
+        dropped = len(symbols) - len(kept)
+        formatted = [s + ".KA" if not s.endswith(".KA") else s for s in kept]
         uniq = list(dict.fromkeys(formatted))
-        return uniq, f"PSX official trading board ({len(uniq)} symbols, by volume)"
+        return uniq, (f"PSX official trading board ({len(uniq)} symbols, by volume; "
+                      f"{dropped} derived XD/NC/rights symbols skipped)")
     return PSX_FALLBACK_UNIVERSE, f"curated fallback ({len(PSX_FALLBACK_UNIVERSE)}) — PSX trading board unavailable"
 
 # ============================================================
@@ -1173,7 +1198,7 @@ def trend_engine(d):
     else: trend = "STRONG BEARISH"
     return trend, reasons, score
 
-def support_resistance(d):
+def _sr_basic(d):
     prior = d.iloc[:-1] if len(d) > 1 else d
     r20 = prior.tail(20) if len(prior) >= 20 else prior
     r60 = prior.tail(60) if len(prior) >= 60 else prior
@@ -1187,7 +1212,76 @@ def support_resistance(d):
             "secondary_support": secondary_support, "secondary_resistance": secondary_resistance,
             "high_52w": last.get("52W_HIGH", np.nan), "low_52w": last.get("52W_LOW", np.nan),
             "secondary_support_is_distinct": secondary_support != primary_support,
-            "secondary_resistance_is_distinct": secondary_resistance != primary_resistance}
+            "secondary_resistance_is_distinct": secondary_resistance != primary_resistance,
+            "range_high20": primary_resistance, "range_low20": primary_support,
+            "support_zones": [], "resistance_zones": []}
+
+def _cluster_levels(points, tol):
+    """points = [(bar_index, price)]. Greedy clustering on sorted prices (distance to cluster mean)."""
+    clusters = []
+    for idx, p in sorted(points, key=lambda t: t[1]):
+        if clusters and p - float(np.mean(clusters[-1]["prices"])) <= tol:
+            clusters[-1]["prices"].append(p); clusters[-1]["idx"].append(idx)
+        else:
+            clusters.append({"prices": [p], "idx": [idx]})
+    return [{"level": float(np.median(c["prices"])), "low": float(min(c["prices"])),
+             "high": float(max(c["prices"])), "touches": len(c["prices"]),
+             "last_idx": int(max(c["idx"]))} for c in clusters]
+
+def support_resistance(d):
+    """v9.0: swing-pivot zones. primary_* = NEAREST zone below/above price (not the raw 20-day
+    extreme); falls back to the 20-day range when no pivot qualifies. Zones carry touch counts."""
+    base = _sr_basic(d)
+    try:
+        if len(d) < 40:
+            return base
+        price = float(d["Close"].iloc[-1])
+        atr_val = float(d["ATR14"].iloc[-1]) if "ATR14" in d.columns and not pd.isna(d["ATR14"].iloc[-1]) else price * 0.02
+        atr_val = max(atr_val, price * 0.004)
+        x = d.tail(260); n = len(x); win = 4
+        highs = x["High"].to_numpy(dtype=float); lows = x["Low"].to_numpy(dtype=float)
+        pts = []
+        for i in range(win, n - win):
+            if highs[i] >= highs[i - win:i + win + 1].max(): pts.append((i, highs[i]))
+            if lows[i] <= lows[i - win:i + win + 1].min(): pts.append((i, lows[i]))
+        if len(pts) < 3:
+            return base
+        tol = max(0.012 * price, 0.6 * atr_val)
+        pad = 0.25 * atr_val
+        zones = _cluster_levels(pts, tol)
+        for z in zones:
+            z["low"] = min(z["low"], z["level"] - pad); z["high"] = max(z["high"], z["level"] + pad)
+            z["note"] = f"{z['touches']} touch" + ("es" if z["touches"] != 1 else "")
+        sup = sorted([z for z in zones if z["level"] < price * 0.998], key=lambda z: -z["level"])
+        res = sorted([z for z in zones if z["level"] > price * 1.002], key=lambda z: z["level"])
+        def _pick(lst):
+            strong = [z for z in lst if z["touches"] >= 2]
+            return (strong if strong else lst)[:2]
+        sup = _pick(sup); res = _pick(res)
+        lo20, hi20 = float(base["range_low20"]), float(base["range_high20"])
+        # recent 20d extreme is always eligible if it is a nearer level than the pivot zone
+        if lo20 < price * 0.998 and (not sup or lo20 > sup[0]["level"] * 1.005):
+            sup = ([{"level": lo20, "low": lo20 - pad, "high": lo20 + pad, "touches": 1, "note": "20d low"}] + sup)[:2]
+        if hi20 > price * 1.002 and (not res or hi20 < res[0]["level"] * 0.995):
+            res = ([{"level": hi20, "low": hi20 - pad, "high": hi20 + pad, "touches": 1, "note": "20d high"}] + res)[:2]
+        prior = d.iloc[:-1] if len(d) > 1 else d
+        r120 = prior.tail(120)
+        if sup:
+            base["primary_support"] = sup[0]["level"]
+            base["secondary_support"] = sup[1]["level"] if len(sup) > 1 else float(r120["Low"].min())
+        if res:
+            base["primary_resistance"] = res[0]["level"]
+            base["secondary_resistance"] = res[1]["level"] if len(res) > 1 else float(r120["High"].max())
+        if base["secondary_support"] >= base["primary_support"]:
+            base["secondary_support"] = min(float(r120["Low"].min()), base["primary_support"] - 2 * atr_val)
+        if base["secondary_resistance"] <= base["primary_resistance"]:
+            base["secondary_resistance"] = max(float(r120["High"].max()), base["primary_resistance"] + 2 * atr_val)
+        base["secondary_support_is_distinct"] = base["secondary_support"] != base["primary_support"]
+        base["secondary_resistance_is_distinct"] = base["secondary_resistance"] != base["primary_resistance"]
+        base["support_zones"] = sup; base["resistance_zones"] = res
+    except Exception:
+        return _sr_basic(d)
+    return base
 
 def breakout_engine(d, sr, vol_ratio_threshold=1.5):
     last = d.iloc[-1]
@@ -1324,7 +1418,7 @@ def detect_penny_setup(d, sr, threshold=PENNY_STOCK_THRESHOLD, rvol_threshold=2.
     near_resistance = False
     if price > 0 and sr["primary_resistance"]:
         near_resistance = abs(price - sr["primary_resistance"]) / price < 0.05
-    broke_resistance = price > sr["primary_resistance"]
+    broke_resistance = price > sr.get("range_high20", sr["primary_resistance"])
     rvol_expansion = vol_ratio >= rvol_threshold
     momentum_positive = last["MACD_HIST"] > 0
     if broke_resistance and rvol_expansion and momentum_positive:
@@ -1341,33 +1435,47 @@ def detect_penny_setup(d, sr, threshold=PENNY_STOCK_THRESHOLD, rvol_threshold=2.
             "vol_ratio": vol_ratio, "near_resistance": near_resistance,
             "broke_resistance": broke_resistance, "rvol_expansion": rvol_expansion}
 
-def risk_engine(d, sr, breakout_status=""):
+def compute_stop(d, sr, entry, atr_val, max_pct):
+    """Stop = nearest real support (>= 1 ATR away) else 1.5 ATR, but never further than the user cap
+    (and never beyond the 10% hard ceiling / 2.5 ATR). Returns (stop, basis)."""
+    max_pct = max(0.01, min(float(max_pct), STOP_MAX_PCT))
+    swing_low = d.tail(10)["Low"].min()
+    buffer = 0.3 * atr_val
+    levels = [swing_low - buffer, sr["primary_support"] - buffer]
+    room = STOP_MIN_ATR * atr_val
+    valid = [lv for lv in levels if lv < entry and lv <= entry - room]
+    pct_floor = entry * (1 - max_pct)
+    if atr_val > 0:
+        structure = max(valid) if valid else entry - 1.5 * atr_val
+        floor = max(entry - STOP_MAX_ATR * atr_val, pct_floor)
+    else:
+        structure = max(valid) if valid else entry * 0.95
+        floor = pct_floor
+    stop = max(structure, floor)
+    if structure >= floor:
+        basis = "support (nearest)" if valid else "1.5 ATR"
+    elif atr_val > 0 and entry - STOP_MAX_ATR * atr_val >= pct_floor:
+        basis = f"{STOP_MAX_ATR:g} ATR cap"
+    else:
+        basis = f"{max_pct * 100:g}% cap"
+    return stop, basis
+
+def _zone_rr(d, sr, zone_mid, target, atr_val, max_pct):
+    if target is None or zone_mid is None or target <= zone_mid:
+        return None
+    stop_z, _ = compute_stop(d, sr, zone_mid, atr_val, max_pct)
+    if stop_z >= zone_mid:
+        return None
+    return (target - zone_mid) / (zone_mid - stop_z)
+
+def risk_engine(d, sr, breakout_status="", max_stop_pct=DEFAULT_STOP_PCT, trend=None):
     last = d.iloc[-1]; price = last["Close"]
     atr_val = last["ATR14"] if not pd.isna(last["ATR14"]) else 0
     if price is None or price <= 0:
         return {"entry": None, "stop_loss": None, "risk_per_share": None, "target1": None,
                 "target2": None, "rr1": None, "rr2": None, "conditional_entry": None,
                 "conditional_entry_note": "Invalid price", "error": "Invalid entry price"}
-    # v8.9.2: nearest meaningful support, kept within [1.0, 2.5] ATR and <= 10% of entry.
-    # (Old logic took min(swing low, 20d support) = the FARTHEST level -> 25-36% stops.)
-    swing_low = d.tail(10)["Low"].min()
-    buffer = 0.3 * atr_val
-    levels = [swing_low - buffer, sr["primary_support"] - buffer]
-    room = STOP_MIN_ATR * atr_val
-    valid = [lv for lv in levels if lv <= price - room and lv < price]
-    if atr_val > 0:
-        structure = max(valid) if valid else price - 1.5 * atr_val
-        floor = max(price - STOP_MAX_ATR * atr_val, price * (1 - STOP_MAX_PCT))
-    else:
-        structure = max(valid) if valid else price * 0.95
-        floor = price * (1 - STOP_MAX_PCT)
-    stop_loss = max(structure, floor)
-    if structure >= floor:
-        stop_basis = "support (nearest)"
-    elif atr_val > 0 and price - STOP_MAX_ATR * atr_val >= price * (1 - STOP_MAX_PCT):
-        stop_basis = f"{STOP_MAX_ATR:g} ATR cap"
-    else:
-        stop_basis = f"{int(STOP_MAX_PCT * 100)}% cap"
+    stop_loss, stop_basis = compute_stop(d, sr, price, atr_val, max_stop_pct)
     if stop_loss is None or stop_loss >= price:
         return {"entry": price, "stop_loss": None, "risk_per_share": None, "target1": None,
                 "target2": None, "rr1": None, "rr2": None, "conditional_entry": None,
@@ -1398,12 +1506,42 @@ def risk_engine(d, sr, breakout_status=""):
         if ema20_val is not None:
             conditional_entry = round(ema20_val, 2)
             conditional_entry_note = "Wait for pullback near EMA20"
+    # ---- v9.0: buy zones (long ideas only) ----
+    bearish = trend in ("BEARISH", "STRONG BEARISH")
+    dip_low = dip_high = brk_low = brk_high = rr_dip = rr_brk = None
+    dip_note = ""
+    if not bearish and atr_val > 0:
+        ema20_val = last["EMA20"] if not pd.isna(last["EMA20"]) else None
+        level20 = sr.get("range_high20")
+        anchor = None
+        if level20 is not None and price > level20 and price - level20 > 0.5 * atr_val:
+            anchor, dip_note = float(level20), "breakout retest"
+        elif ema20_val is not None and ema20_val < price - 0.25 * atr_val:
+            anchor, dip_note = float(ema20_val), "EMA20 pullback"
+        elif sr["primary_support"] < price - 0.25 * atr_val:
+            anchor, dip_note = float(sr["primary_support"]), "support"
+        if anchor is not None:
+            lo = anchor - 0.25 * atr_val; hi = min(anchor + 0.5 * atr_val, float(price))
+            if lo < hi:
+                dip_low, dip_high = lo, hi
+                rr_dip = _zone_rr(d, sr, (lo + hi) / 2, target1, atr_val, max_stop_pct)
+        res1 = sr["primary_resistance"]
+        if price < res1 and (res1 - price) / price <= 0.08:
+            brk_low, brk_high = float(res1), float(res1 + 0.5 * atr_val)
+            mid_b = (brk_low + brk_high) / 2
+            t_b = max(sr["secondary_resistance"], mid_b + 2.5 * atr_val)
+            rr_brk = _zone_rr(d, sr, mid_b, t_b, atr_val, max_stop_pct)
+    stop_atr = risk_per_share / atr_val if atr_val > 0 else None
     return {"entry": price, "stop_loss": stop_loss, "risk_per_share": risk_per_share,
             "target1": target1, "target2": target2, "rr1": rr1, "rr2": rr2,
             "conditional_entry": conditional_entry,
             "conditional_entry_note": conditional_entry_note, "error": None,
             "risk_pct": round(risk_per_share / price * 100, 1) if price > 0 else None,
-            "stop_basis": stop_basis}
+            "stop_basis": stop_basis, "stop_atr": stop_atr,
+            "stop_noise": bool(stop_atr is not None and stop_atr < 1.0),
+            "max_stop_pct": float(max_stop_pct),
+            "dip_low": dip_low, "dip_high": dip_high, "dip_note": dip_note, "rr_dip": rr_dip,
+            "brk_low": brk_low, "brk_high": brk_high, "rr_brk": rr_brk}
 
 # ============================================================
 # SCORING & SIGNAL
@@ -1501,6 +1639,14 @@ def signal_engine(d, trend, trend_score, momentum, breakout, pullback, sr, risk_
         if not rr_ok:
             rr_val = round(risk_data['rr1'], 2) if risk_data['rr1'] else 'N/A'
             reasons.append(f"❌ Risk:Reward kam hai ({rr_val})")
+            _dl, _dh, _rd = risk_data.get("dip_low"), risk_data.get("dip_high"), risk_data.get("rr_dip")
+            if _dl is not None and _dh is not None:
+                _rd_txt = f" (R:R ~{round(_rd, 2)})" if _rd else ""
+                reasons.insert(0, f"⏳ WAIT kyun: abhi entry pe R:R {rr_val} < {MIN_RR}. "
+                                  f"Dip zone {round(_dl, 2)}–{round(_dh, 2)} mein entry behtar{_rd_txt}")
+            else:
+                reasons.insert(0, f"⏳ WAIT kyun: abhi entry pe R:R {rr_val} < {MIN_RR} — "
+                                  f"target, stop ke muqable door nahi")
         if market["regime"] == "BULLISH": reasons.append("✅ Overall market bullish")
         elif market["regime"] == "BEARISH": reasons.append("❌ Overall market bearish")
     return {"score": adjusted_score, "components": components, "signal": signal,
@@ -1580,7 +1726,8 @@ def classify_stock(price: float, avg_volume: float) -> str:
 def analyze_stock(ticker: str, period: str = "1y",
                   penny_threshold: float = PENNY_STOCK_THRESHOLD,
                   rvol_threshold: float = 2.0,
-                  market: Optional[Dict] = None):
+                  market: Optional[Dict] = None,
+                  max_stop_pct: float = DEFAULT_STOP_PCT):
     df, status, error, source = fetch_ohlcv(ticker, period=period)
     if status != "SUCCESS" or df is None or df.empty:
         return None, status, error, source
@@ -1592,7 +1739,7 @@ def analyze_stock(ticker: str, period: str = "1y",
     breakout = breakout_engine(d, sr)
     pullback = pullback_engine(d, trend, sr)
     momentum = momentum_engine(d)
-    risk = risk_engine(d, sr, breakout["status"])
+    risk = risk_engine(d, sr, breakout["status"], max_stop_pct=max_stop_pct, trend=trend)
     penny = detect_penny_setup(d, sr, threshold=penny_threshold, rvol_threshold=rvol_threshold)
     projection = projection_engine(d, trend, sr, momentum)
     signal = signal_engine(d, trend, trend_score, momentum, breakout, pullback, sr, risk, market)
@@ -1626,13 +1773,19 @@ def analyze_stock(ticker: str, period: str = "1y",
     result["confidence"] = calculate_confidence(result, fresh_status)
     return result, "SUCCESS", None, source
 
+def _fmt_zone(lo, hi) -> Optional[str]:
+    if lo is None or hi is None:
+        return None
+    return f"{lo:.2f} – {hi:.2f}"
+
 def _empty_screener_df() -> pd.DataFrame:
     return pd.DataFrame(columns=SCREENER_COLUMNS)
 
 def run_screener(universe: List[str], period: str = "1y",
                  penny_threshold: float = PENNY_STOCK_THRESHOLD,
                  rvol_threshold: float = 2.0,
-                 market: Optional[Dict] = None):
+                 market: Optional[Dict] = None,
+                 max_stop_pct: float = DEFAULT_STOP_PCT):
     rows = []
     coverage = {"total": len(universe), "success": 0, "failed": 0, "analyzed": 0}
     total = len(universe)
@@ -1644,7 +1797,7 @@ def run_screener(universe: List[str], period: str = "1y",
         try:
             result, status, error, source = analyze_stock(
                 ticker, period=period, penny_threshold=penny_threshold,
-                rvol_threshold=rvol_threshold, market=market)
+                rvol_threshold=rvol_threshold, market=market, max_stop_pct=max_stop_pct)
         except Exception as e:
             result, status, error, source = None, "EXCEPTION", str(e), "UNAVAILABLE"
         if status != "SUCCESS" or result is None:
@@ -1685,6 +1838,18 @@ def run_screener(universe: List[str], period: str = "1y",
                     rr_badge = "⚠️ Low R:R"
                 elif rr_val < MIN_RR:
                     rr_badge = "low-mid R:R"
+            if result["risk"].get("stop_noise"):
+                rr_badge = (rr_badge + " · " if rr_badge else "") + "🔔 tight stop"
+            if result["trend"] in ("BEARISH", "STRONG BEARISH"):
+                rr_badge = "🚫 bearish: long plan N/A"
+            _rk = result["risk"]
+            _rsi = float(last["RSI14"]) if not pd.isna(last["RSI14"]) else None
+            _bull = result["trend"] in ("BULLISH", "STRONG BULLISH")
+            _zone = result["pullback"]["status"] in ("HEALTHY PULLBACK", "PULLBACK WATCH")
+            _rsi_ok = _rsi is not None and 35 <= _rsi <= 55
+            _candle_ok = float(last["Close"]) > float(last["Open"])
+            pb_checks = (f"{'✅' if _bull else '❌'} Trend · {'✅' if _zone else '❌'} Zone · "
+                         f"{'✅' if _rsi_ok else '❌'} RSI · {'✅' if _candle_ok else '❌'} Candle")
             conf = result.get("confidence", {}).get("level", "N/A")
             rows.append({
                 "Ticker": result["ticker_display"],
@@ -1703,6 +1868,12 @@ def run_screener(universe: List[str], period: str = "1y",
                 "Cap Size": result["cap_size"], "Source": result["data_source"],
                 "Why": why_text, "Avg Volume": round(avg_volume, 0),
                 "Risk %": result["risk"].get("risk_pct"),
+                "Stop ATR": round(_rk["stop_atr"], 1) if _rk.get("stop_atr") is not None else None,
+                "Buy on Dip": _fmt_zone(_rk.get("dip_low"), _rk.get("dip_high")),
+                "RR @Dip": round(_rk["rr_dip"], 2) if _rk.get("rr_dip") else None,
+                "Buy on Breakout": _fmt_zone(_rk.get("brk_low"), _rk.get("brk_high")),
+                "Pullback Checks": pb_checks,
+                "RSI": round(_rsi, 1) if _rsi is not None else None,
                 "EMA20": round(float(last["EMA20"]), 2) if not pd.isna(last["EMA20"]) else None,
                 "Above EMA20 %": round((float(last["Close"]) / float(last["EMA20"]) - 1) * 100, 1)
                                  if not pd.isna(last["EMA20"]) and last["EMA20"] > 0 else None,
@@ -1755,49 +1926,137 @@ def estimate_pace_to_target(result: Dict) -> Tuple[str, str]:
 def categorize_top_picks(screener_df: pd.DataFrame,
                         penny_threshold: float = PENNY_STOCK_THRESHOLD,
                         rvol_threshold: float = 2.0) -> Dict[str, pd.DataFrame]:
+    """Each ticker appears in ONE category only: Hold > Swing > Day (v9.0)."""
     empty = pd.DataFrame()
-    if screener_df is None or screener_df.empty:
-        return {"day": empty, "swing": empty, "hold": empty}
-    if "Signal" not in screener_df.columns:
-        return {"day": empty, "swing": empty, "hold": empty}
+    out = {"day": empty, "swing": empty, "hold": empty, "moved": []}
+    if screener_df is None or screener_df.empty or "Signal" not in screener_df.columns:
+        return out
     df = screener_df[screener_df["Signal"] != "ERROR"].copy()
     if df.empty:
-        return {"day": empty, "swing": empty, "hold": empty}
+        return out
     for col in ["Status", "Score", "Trend", "RR"]:
         if col not in df.columns:
             df[col] = None
-
+    score = pd.to_numeric(df["Score"], errors="coerce").fillna(0)
+    rr = pd.to_numeric(df["RR"], errors="coerce").fillna(0)
+    trend_s = df["Trend"].astype(str)
     _st = df["Status"].astype(str)
+
+    hold_mask = (trend_s.str.contains("STRONG BULLISH", case=False, na=False) & (score >= 60) & (rr >= 1.5))
+    swing_mask = (trend_s.str.contains("BULLISH", case=False, na=False)
+                  & ~trend_s.str.contains("STRONG BULLISH", case=False, na=False)
+                  & (rr >= 1.5) & (score >= 45))
     day_mask = (_st.str.contains("BREAKOUT|READY|ATTEMPT", case=False, na=False)
-                & ~_st.str.upper().str.startswith("NO BREAKOUT")        # v8.9.2: was matching "NO BREAKOUT"
+                & ~_st.str.upper().str.startswith("NO BREAKOUT")
                 & ~_st.str.contains("UNAVAILABLE|ERROR", case=False, na=False)
-                & (pd.to_numeric(df["Score"], errors="coerce").fillna(0) >= 55))
-    day_df = df[day_mask].copy()
-    if not day_df.empty:
-        day_df = day_df.sort_values("Score", ascending=False).head(10)
-        day_df["Hold Estimate"] = "1-2 sessions"
-        day_df["Basis"] = "Momentum + breakout structure"
+                & (score >= 55))
 
-    swing_mask = (df["Trend"].astype(str).str.contains("BULLISH", case=False, na=False)
-                  & (~df["Trend"].astype(str).str.contains("STRONG BULLISH", case=False, na=False))
-                  & (pd.to_numeric(df["RR"], errors="coerce").fillna(0) >= 1.5)
-                  & (pd.to_numeric(df["Score"], errors="coerce").fillna(0) >= 45))
-    swing_df = df[swing_mask].copy()
-    if not swing_df.empty:
-        swing_df = swing_df.sort_values("Score", ascending=False).head(10)
-        swing_df["Hold Estimate"] = "5-15 sessions (technical estimate)"
-        swing_df["Basis"] = "Trend + R:R >= 1.5"
-
-    hold_mask = (df["Trend"].astype(str).str.contains("STRONG BULLISH", case=False, na=False)
-                 & (pd.to_numeric(df["Score"], errors="coerce").fillna(0) >= 60)
-                 & (pd.to_numeric(df["RR"], errors="coerce").fillna(0) >= 1.5))
-    hold_df = df[hold_mask].copy()
+    hold_df = df[hold_mask].sort_values("Score", ascending=False).head(10).copy()
     if not hold_df.empty:
-        hold_df = hold_df.sort_values("Score", ascending=False).head(10)
         hold_df["Hold Estimate"] = "15-40 sessions (technical estimate)"
         hold_df["Basis"] = "Strong trend + healthy R:R"
+    taken = set(hold_df["Ticker"]) if not hold_df.empty else set()
 
-    return {"day": day_df, "swing": swing_df, "hold": hold_df}
+    swing_df = df[swing_mask & ~df["Ticker"].isin(taken)].sort_values("Score", ascending=False).head(10).copy()
+    if not swing_df.empty:
+        swing_df["Hold Estimate"] = "5-15 sessions (technical estimate)"
+        swing_df["Basis"] = "Trend + R:R >= 1.5"
+    taken |= set(swing_df["Ticker"]) if not swing_df.empty else set()
+
+    day_all = df[day_mask]
+    moved = [t for t in day_all["Ticker"] if t in taken]
+    day_df = day_all[~day_all["Ticker"].isin(taken)].sort_values("Score", ascending=False).head(10).copy()
+    if not day_df.empty:
+        day_df["Hold Estimate"] = "1-2 sessions"
+        day_df["Basis"] = "Momentum + breakout structure"
+    return {"day": day_df, "swing": swing_df, "hold": hold_df, "moved": moved}
+
+# ============================================================
+# RECOVERY PLANNER (v9.0) - facts and arithmetic for a losing holding, not advice
+# ============================================================
+
+def switch_candidates(df: Optional[pd.DataFrame], exclude: List[str], need_pct: float, n: int = 3) -> pd.DataFrame:
+    """Best-scoring bullish candidates from the latest scan + how many successful T1 trades
+    would be needed to climb back to break-even (pure arithmetic)."""
+    cols = ["Ticker", "Signal", "Score", "Entry", "Stop Loss", "Risk %", "Target 1", "T1 gain %",
+            "RR", "Wins to recover"]
+    if df is None or df.empty or "Signal" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    w = df[df["Signal"] != "ERROR"].copy()
+    w = w[w["Trend"].isin(["BULLISH", "STRONG BULLISH"])]
+    w["RR"] = pd.to_numeric(w["RR"], errors="coerce")
+    w = w[(w["RR"] >= 1.0) & ~w["Ticker"].isin(exclude)]
+    if w.empty:
+        return pd.DataFrame(columns=cols)
+    for c in ["Entry", "Target 1", "Stop Loss", "Score"]:
+        w[c] = pd.to_numeric(w[c], errors="coerce")
+    w = w.dropna(subset=["Entry", "Target 1"])
+    w["T1 gain %"] = ((w["Target 1"] / w["Entry"] - 1) * 100).round(1)
+    def _wins(g):
+        if g is None or pd.isna(g) or g <= 0 or need_pct is None or need_pct <= 0:
+            return None
+        return int(np.ceil(np.log(1 + need_pct / 100) / np.log(1 + g / 100)))
+    w["Wins to recover"] = w["T1 gain %"].map(_wins)
+    w = w.sort_values("Score", ascending=False).head(n)
+    return w[[c for c in cols if c in w.columns]]
+
+def recovery_plan(holding: Dict, result: Dict, active_stop: Optional[float]) -> Optional[Dict]:
+    price = float(result["display_price"]); buy = float(holding["buy_price"]); shares = int(holding["shares"])
+    last = result["last"]; d = result["df"]; sr = result["sr"]
+    invested = buy * shares; value = price * shares; pnl = value - invested
+    if pnl >= 0 or price <= 0:
+        return None
+    loss = invested - value
+    need_pct = (buy / price - 1) * 100
+    atr = float(last["ATR14"]) if not pd.isna(last["ATR14"]) else None
+    sigma = float(d["Close"].pct_change().tail(60).std()) * price
+    dist = buy - price
+    best_sessions = dist / atr if atr and atr > 0 else None
+    scale_sessions = (dist / sigma) ** 2 if sigma and sigma > 0 else None
+    def _date_after(nsess):
+        if nsess is None or nsess > 1500:
+            return None
+        try:
+            return pd.Timestamp(np.busday_offset(pkt_now().date(), int(round(nsess)), roll="forward"))
+        except Exception:
+            return None
+    # levels to reclaim
+    cands = [("EMA20", last["EMA20"]), ("SMA20", last["SMA20"]), ("SMA50", last["SMA50"]),
+             ("Resistance 1", sr["primary_resistance"]), ("Resistance 2", sr["secondary_resistance"]),
+             ("SMA200", last.get("SMA200", np.nan))]
+    lv = []
+    for name, v in cands:
+        if v is None or pd.isna(v) or float(v) <= price * 1.003 or float(v) >= buy:
+            continue
+        lv.append((name, float(v)))
+    lv.append(("Break-even (aap ki buy price)", buy))
+    lv.sort(key=lambda t: t[1])
+    merged = []
+    for name, v in lv:
+        if merged and abs(v / merged[-1][1] - 1) < 0.01:
+            merged[-1] = (merged[-1][0] + " / " + name, merged[-1][1])
+        else:
+            merged.append((name, v))
+    levels = [{"Level": n, "Price": round(v, 2), "Gain from here %": round((v / price - 1) * 100, 1),
+               "Loss recovered %": round(min(100.0, (v - price) * shares / loss * 100), 0)} for n, v in merged]
+    # trend repair checklist
+    rsi_v = float(last["RSI14"]) if not pd.isna(last["RSI14"]) else np.nan
+    macd_h = float(last["MACD_HIST"]) if not pd.isna(last["MACD_HIST"]) else np.nan
+    rvol = float(last["VOL_RATIO"]) if not pd.isna(last["VOL_RATIO"]) else np.nan
+    s20 = float(last["SMA20"]); s50 = float(last["SMA50"])
+    checks = [("Price SMA20 ke upar", price > s20, f"{price:.2f} vs {s20:.2f}"),
+              ("SMA20 > SMA50", s20 > s50, f"{s20:.2f} vs {s50:.2f}"),
+              ("Price SMA50 ke upar", price > s50, f"{price:.2f} vs {s50:.2f}"),
+              ("RSI > 50", (not pd.isna(rsi_v)) and rsi_v > 50, f"{rsi_v:.1f}"),
+              ("MACD histogram > 0", (not pd.isna(macd_h)) and macd_h > 0, f"{macd_h:.3f}"),
+              ("Volume support (RVOL >= 1.2)", (not pd.isna(rvol)) and rvol >= 1.2, f"{rvol:.2f}x")]
+    further = (price - active_stop) * shares if active_stop is not None and active_stop < price else None
+    return {"price": price, "buy": buy, "shares": shares, "invested": invested, "value": value,
+            "pnl": pnl, "loss": loss, "need_pct": need_pct, "atr": atr,
+            "best_sessions": best_sessions, "best_date": _date_after(best_sessions),
+            "scale_sessions": scale_sessions, "scale_date": _date_after(scale_sessions),
+            "levels": levels, "checks": checks, "further_to_stop": further,
+            "active_stop": active_stop}
 
 # ============================================================
 # PORTFOLIO DECISION
@@ -1844,128 +2103,162 @@ def portfolio_decision(holding: Dict, result: Dict) -> Tuple[str, str]:
 # ============================================================
 
 def build_chart(result, show_bb=False, show_sma200=False,
-                show_support_resistance=True, show_rsi=False, show_macd=False):
-    d = result["df"].tail(150)
+                show_support_resistance=True, show_rsi=False, show_macd=False,
+                show_zones=True, bars=120):
+    d = result["df"].tail(int(bars))
     risk = result["risk"]; sr = result["sr"]; trend = result["trend"]
     proj = result.get("projection", {})
-    signal_label = result.get("signal", {}).get("signal", "")
-    is_long_signal = signal_label in ("STRONG BUY", "BUY")
+    is_bear = trend in ("BEARISH", "STRONG BEARISH")
+    price_now = float(d["Close"].iloc[-1])
 
-    num_rows = 2  # price + volume (v8.8)
+    # ---- projection geometry first (so the y-range can include it) ----
+    proj_dir = proj.get("direction"); proj_x = proj_y = None; target_price = None; basis = ""
+    try:
+        if (proj_dir in ("UP", "DOWN") and proj.get("zone_low") is not None
+                and proj.get("zone_high") is not None and len(d) >= 2):
+            future_dates = pd.bdate_range(start=d.index[-1], periods=11, freq="B")[1:]
+            target_price = float(proj["zone_high"]) if proj_dir == "UP" else float(proj["zone_low"])
+            fut = np.linspace(price_now, target_price, len(future_dates) + 1)[1:]
+            proj_x = [d.index[-1]] + list(future_dates); proj_y = [price_now] + list(fut)
+            basis = "Upside zone" if proj_dir == "UP" else "Downside zone"
+    except Exception:
+        proj_x = proj_y = None
+
+    y_lo = float(d["Low"].min()); y_hi = float(d["High"].max())
+    if target_price is not None:
+        y_lo = min(y_lo, target_price); y_hi = max(y_hi, target_price)
+    pad = (y_hi - y_lo) * 0.06 if y_hi > y_lo else price_now * 0.03
+
+    num_rows = 2
     if show_rsi: num_rows += 1
     if show_macd: num_rows += 1
-    row_heights = [0.58, 0.14]
-    if show_rsi: row_heights.append(0.14)
-    if show_macd: row_heights.append(0.14)
-    subplot_titles = ["Price", "Volume"]
-    if show_rsi: subplot_titles.append("RSI (14)")
-    if show_macd: subplot_titles.append("MACD")
-
-    fig = make_subplots(rows=num_rows, cols=1, shared_xaxes=True,
-        row_heights=row_heights, vertical_spacing=0.04, subplot_titles=subplot_titles)
+    row_heights = [0.62, 0.14]
+    if show_rsi: row_heights.append(0.12)
+    if show_macd: row_heights.append(0.12)
+    titles = [" ", "Volume"] + (["RSI (14)"] if show_rsi else []) + (["MACD"] if show_macd else [])
+    fig = make_subplots(rows=num_rows, cols=1, shared_xaxes=True, row_heights=row_heights,
+                        vertical_spacing=0.035, subplot_titles=titles)
     row = 1
-    fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"],
-        low=d["Low"], close=d["Close"], name="Price",
-        increasing_line_color="#10B981", decreasing_line_color="#EF4444"), row=row, col=1)
-    trend_color = "#10B981" if trend in ("BULLISH", "STRONG BULLISH") else \
-                  "#EF4444" if trend in ("BEARISH", "STRONG BEARISH") else "#F59E0B"
-    trend_arrow = "↑" if trend in ("BULLISH", "STRONG BULLISH") else \
-                  "↓" if trend in ("BEARISH", "STRONG BEARISH") else "→"
-    fig.add_annotation(x=0.02, y=0.98, xref="paper", yref="paper",
-        text=f"{trend_arrow} TREND: {trend}", showarrow=False,
-        font=dict(color=trend_color, size=14, family="monospace"),
-        bgcolor="rgba(255, 255, 255, 0.9)", bordercolor=trend_color,
-        borderwidth=1, borderpad=4, opacity=0.95)
-    fig.add_trace(go.Scatter(x=d.index, y=d["SMA20"],
-        line=dict(color="#3B82F6", width=1.2), name="SMA20"), row=row, col=1)
-    fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"],
-        line=dict(color="#F59E0B", width=1.2), name="SMA50"), row=row, col=1)
+    UP, DN = "#00B386", "#F23645"
+    fig.add_trace(go.Candlestick(
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price",
+        increasing=dict(line=dict(color=UP, width=1.2), fillcolor=UP),
+        decreasing=dict(line=dict(color=DN, width=1.2), fillcolor=DN)), row=row, col=1)
+    trend_color = "#00B386" if trend in ("BULLISH", "STRONG BULLISH") else \
+                  "#F23645" if is_bear else "#F59E0B"
+    trend_arrow = "↑" if trend in ("BULLISH", "STRONG BULLISH") else "↓" if is_bear else "→"
+    fig.add_annotation(x=0.01, y=0.99, xref="paper", yref="paper", xanchor="left", yanchor="top",
+        text=f"{trend_arrow} {trend}", showarrow=False,
+        font=dict(color=trend_color, size=13, family="monospace"),
+        bgcolor="rgba(255,255,255,0.92)", bordercolor=trend_color, borderwidth=1, borderpad=3)
+    fig.add_trace(go.Scatter(x=d.index, y=d["SMA20"], line=dict(color="#2563EB", width=2), name="SMA20"), row=row, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"], line=dict(color="#F59E0B", width=2), name="SMA50"), row=row, col=1)
     if show_sma200 and result["has_sma200"]:
-        fig.add_trace(go.Scatter(x=d.index, y=d["SMA200"],
-            line=dict(color="#8B5CF6", width=1, dash="dot"), name="SMA200"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["SMA200"], line=dict(color="#8B5CF6", width=1.6, dash="dot"),
+                                 name="SMA200"), row=row, col=1)
     if show_bb:
-        fig.add_trace(go.Scatter(x=d.index, y=d["BB_UPPER"],
-            line=dict(color="#94A3B8", width=0.8, dash="dot"), name="BB Upper"), row=row, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d["BB_LOWER"],
-            line=dict(color="#94A3B8", width=0.8, dash="dot"), name="BB Lower"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["BB_UPPER"], line=dict(color="#94A3B8", width=0.9, dash="dot"),
+                                 name="BB Upper"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["BB_LOWER"], line=dict(color="#94A3B8", width=0.9, dash="dot"),
+                                 name="BB Lower"), row=row, col=1)
+
+    def _visible(lo, hi):
+        return not (hi < y_lo - pad or lo > y_hi + pad)
+
     if show_support_resistance:
-        fig.add_hline(y=sr["primary_resistance"], line_dash="dash",
-            line_color="#EF4444", annotation_text="Resistance", row=row, col=1)
-        fig.add_hline(y=sr["primary_support"], line_dash="dash",
-            line_color="#10B981", annotation_text="Support", row=row, col=1)
-    if is_long_signal:
-        if risk.get("stop_loss") and risk["stop_loss"] > 0:
-            fig.add_hline(y=risk["stop_loss"], line_dash="dot",
-                line_color="#F59E0B", annotation_text="Stop", row=row, col=1)
-        if risk.get("target1") and risk["target1"] > 0:
-            fig.add_hline(y=risk["target1"], line_dash="dot",
-                line_color="#3B82F6", annotation_text="T1", row=row, col=1)
-    try:
-        proj_dir = proj.get("direction")
-        proj_low = proj.get("zone_low")
-        proj_high = proj.get("zone_high")
-        if (proj_dir in ("UP", "DOWN")
-                and proj_low is not None and proj_high is not None
-                and len(d) >= 2):
-            last_date = d.index[-1]
-            future_dates = pd.bdate_range(start=last_date, periods=13, freq="B")[1:]
-            current_price = float(d["Close"].iloc[-1])
-            target_price = float(proj_high) if proj_dir == "UP" else float(proj_low)
-            n = len(future_dates)
-            if n > 0:
-                future_prices = np.linspace(current_price, target_price, n + 1)[1:]
-                arrow_color = "#10B981" if proj_dir == "UP" else "#DC2626"
-                basis = "Upside zone" if proj_dir == "UP" else "Downside zone"
-                proj_x = [last_date] + list(future_dates)
-                proj_y = [current_price] + list(future_prices)
-                fig.add_trace(go.Scatter(x=proj_x, y=proj_y, mode="lines",
-                    line=dict(color=arrow_color, width=2, dash="dash"),
-                    name=f"Projection → {round(target_price, 2)} ({basis})", opacity=0.7,
-                    hovertemplate="Projection<br>Date: %{x|%d-%b}<br>Price: %{y:.2f}<extra></extra>"),
-                    row=row, col=1)
-                fig.add_trace(go.Scatter(x=[future_dates[-1]], y=[future_prices[-1]],
-                    mode="markers+text",
-                    marker=dict(color=arrow_color, size=10,
-                                symbol="triangle-right" if proj_dir == "UP" else "triangle-down"),
-                    text=[f"→ {round(target_price, 2)} ({basis})"],
-                    textposition="middle right", textfont=dict(color=arrow_color, size=11),
-                    name="Projected", showlegend=False,
-                    hovertemplate=f"<b>Projected: {round(target_price, 2)}</b><br>"
-                                  f"Direction: {proj_dir}<br>Basis: {basis}<br>"
-                                  f"<i>Technical estimate, not guaranteed</i><extra></extra>"),
-                    row=row, col=1)
-    except Exception:
-        pass
-    # v8.8: volume panel (green/red by candle) + 20-day average
+        _rz = sr.get("resistance_zones", [])[:2]
+        if len(_rz) == 2 and abs(_rz[1]["level"] - _rz[0]["level"]) / price_now < 0.02: _rz = _rz[:1]   # avoid label overlap
+        for i, z in enumerate(_rz):
+            if not _visible(z["low"], z["high"]): continue
+            fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="#F23645", opacity=0.13 if i == 0 else 0.07,
+                          line_width=0, row=row, col=1)
+            fig.add_hline(y=z["level"], line_color="#D62839", line_width=1.5 if i == 0 else 1, line_dash="dash",
+                          annotation_text=f"R{i+1} {z['level']:.2f} · {z.get('note','')}",
+                          annotation_position="top right", annotation_font_size=10,
+                          annotation_font_color="#D62839", row=row, col=1)
+        _sz = sr.get("support_zones", [])[:2]
+        if len(_sz) == 2 and abs(_sz[1]["level"] - _sz[0]["level"]) / price_now < 0.02: _sz = _sz[:1]
+        for i, z in enumerate(_sz):
+            if not _visible(z["low"], z["high"]): continue
+            fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="#00B386", opacity=0.13 if i == 0 else 0.07,
+                          line_width=0, row=row, col=1)
+            fig.add_hline(y=z["level"], line_color="#00916C", line_width=1.5 if i == 0 else 1, line_dash="dash",
+                          annotation_text=f"S{i+1} {z['level']:.2f} · {z.get('note','')}",
+                          annotation_position="bottom right", annotation_font_size=10,
+                          annotation_font_color="#00916C", row=row, col=1)
+    if not is_bear and not risk.get("error"):
+        if show_zones:
+            if risk.get("dip_low") is not None and _visible(risk["dip_low"], risk["dip_high"]):
+                fig.add_hrect(y0=risk["dip_low"], y1=risk["dip_high"], fillcolor="#2563EB", opacity=0.16,
+                              line_width=0, row=row, col=1,
+                              annotation_text="Buy dip", annotation_position="inside left",
+                              annotation_font_size=10, annotation_font_color="#1D4ED8")
+            if risk.get("brk_low") is not None and _visible(risk["brk_low"], risk["brk_high"]):
+                fig.add_hrect(y0=risk["brk_low"], y1=risk["brk_high"], fillcolor="#7C3AED", opacity=0.16,
+                              line_width=0, row=row, col=1,
+                              annotation_text="Buy breakout", annotation_position="inside left",
+                              annotation_font_size=10, annotation_font_color="#6D28D9")
+        if risk.get("stop_loss") and _visible(risk["stop_loss"], risk["stop_loss"]):
+            fig.add_hline(y=risk["stop_loss"], line_dash="dot", line_color="#F97316", line_width=1.6,
+                          annotation_text=f"Stop {risk['stop_loss']:.2f} (-{risk.get('risk_pct','?')}%)",
+                          annotation_position="bottom left", annotation_font_size=10,
+                          annotation_font_color="#EA580C", row=row, col=1)
+        if risk.get("target1") and _visible(risk["target1"], risk["target1"]):
+            fig.add_hline(y=risk["target1"], line_dash="dot", line_color="#2563EB", line_width=1.6,
+                          annotation_text=f"T1 {risk['target1']:.2f}", annotation_position="top left",
+                          annotation_font_size=10, annotation_font_color="#1D4ED8", row=row, col=1)
+    if proj_x is not None:
+        arrow_color = "#00B386" if proj_dir == "UP" else "#F23645"
+        fig.add_trace(go.Scatter(x=proj_x, y=proj_y, mode="lines", line=dict(color=arrow_color, width=2.2, dash="dash"),
+            name=f"Projection → {target_price:.2f}", opacity=0.85,
+            hovertemplate="Projection<br>%{x|%d-%b}<br>%{y:.2f}<extra></extra>"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=[proj_x[-1]], y=[proj_y[-1]], mode="markers+text",
+            marker=dict(color=arrow_color, size=11, symbol="triangle-right" if proj_dir == "UP" else "triangle-down"),
+            text=[f"{target_price:.2f}"], textposition="top center", textfont=dict(color=arrow_color, size=11),
+            showlegend=False,
+            hovertemplate=f"<b>Projected {target_price:.2f}</b> ({basis})<br><i>Technical estimate, not guaranteed</i><extra></extra>"),
+            row=row, col=1)
+    fig.update_yaxes(range=[y_lo - pad, y_hi + pad], row=1, col=1)
+
     row += 1
-    vol_colors = np.where(d["Close"] >= d["Open"], "#10B981", "#EF4444")
-    fig.add_trace(go.Bar(x=d.index, y=d["Volume"], marker_color=vol_colors,
-        name="Volume", opacity=0.7), row=row, col=1)
+    vol_colors = np.where(d["Close"] >= d["Open"], UP, DN)
+    fig.add_trace(go.Bar(x=d.index, y=d["Volume"], marker_color=vol_colors, name="Volume", opacity=0.75), row=row, col=1)
     if "VOL_SMA20" in d.columns:
-        fig.add_trace(go.Scatter(x=d.index, y=d["VOL_SMA20"],
-            line=dict(color="#6366F1", width=1.2), name="Vol avg20"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["VOL_SMA20"], line=dict(color="#6366F1", width=1.4),
+                                 name="Vol avg20"), row=row, col=1)
     if show_rsi:
         row += 1
-        fig.add_trace(go.Scatter(x=d.index, y=d["RSI14"],
-            line=dict(color="#3B82F6", width=1.3), name="RSI"), row=row, col=1)
-        fig.add_hline(y=70, line_dash="dot", line_color="#EF4444", row=row, col=1)
-        fig.add_hline(y=30, line_dash="dot", line_color="#10B981", row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["RSI14"], line=dict(color="#2563EB", width=1.6), name="RSI"), row=row, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#F23645", row=row, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#00B386", row=row, col=1)
         fig.update_yaxes(range=[0, 100], row=row, col=1)
     if show_macd:
         row += 1
-        fig.add_trace(go.Scatter(x=d.index, y=d["MACD"],
-            line=dict(color="#3B82F6", width=1), name="MACD"), row=row, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d["MACD_SIGNAL"],
-            line=dict(color="#F59E0B", width=1), name="Signal"), row=row, col=1)
-        hist_colors = np.where(d["MACD_HIST"] >= 0, "#10B981", "#EF4444")
-        fig.add_trace(go.Bar(x=d.index, y=d["MACD_HIST"],
-            marker_color=hist_colors, name="Hist"), row=row, col=1)
-    fig.update_layout(height=760 if not show_rsi and not show_macd else 880,
+        fig.add_trace(go.Scatter(x=d.index, y=d["MACD"], line=dict(color="#2563EB", width=1.2), name="MACD"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d["MACD_SIGNAL"], line=dict(color="#F59E0B", width=1.2), name="Signal"), row=row, col=1)
+        hist_colors = np.where(d["MACD_HIST"] >= 0, UP, DN)
+        fig.add_trace(go.Bar(x=d.index, y=d["MACD_HIST"], marker_color=hist_colors, name="Hist"), row=row, col=1)
+
+    # remove weekend + holiday gaps so candles are evenly spaced (less congested)
+    try:
+        idx = pd.DatetimeIndex(d.index).normalize()
+        missing = pd.date_range(idx[0], idx[-1]).difference(idx)
+        miss_wd = [m.strftime("%Y-%m-%d") for m in missing if m.weekday() < 5]
+        rb = [dict(bounds=["sat", "mon"])]
+        if miss_wd: rb.append(dict(values=miss_wd))
+        fig.update_xaxes(rangebreaks=rb)
+    except Exception:
+        pass
+    x_end = (proj_x[-1] if proj_x is not None else d.index[-1]) + pd.Timedelta(days=3)
+    fig.update_xaxes(range=[d.index[0] - pd.Timedelta(days=1), x_end], showgrid=False)
+    fig.update_yaxes(gridcolor="#EEF2F7", zeroline=False)
+    fig.update_layout(height=720 if not (show_rsi or show_macd) else 860,
         showlegend=True, xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=30, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        template="plotly_white")
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=11)),
+        template="plotly_white", plot_bgcolor="#FFFFFF", font=dict(size=12), bargap=0.15)
     return fig
+
 # ============================================================
 # UI HELPERS
 # ============================================================
@@ -2035,7 +2328,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v8.9.2</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v9.0</div>", unsafe_allow_html=True)
 
 _prov_slot = st.sidebar.container()   # v8.9: filled at the END of the script, after all fetches
 
@@ -2085,6 +2378,12 @@ penny_threshold = st.sidebar.number_input("Penny Stock Threshold (PKR)",
 rvol_threshold = st.sidebar.slider("Penny RVOL Threshold (x avg)",
     min_value=1.0, max_value=5.0, value=2.0, step=0.5,
     help="Penny stock pe unusual volume threshold")
+stop_cap_pct = st.sidebar.slider("Max Stop Loss (% of entry)",
+    min_value=2.0, max_value=10.0, value=5.0, step=0.5,
+    help="Stop-loss entry se is % se zyada door nahi hoga. Nearest support is cap ke andar ho to wahi stop banta hai, "
+         "warna cap. Bohot tight (2-3%) rakhoge to roz ki normal hilna-julna (ATR) bhi stop hit kar sakta hai - "
+         "table mein 'Stop ATR' aur 'tight stop' flag dekho. Badalne ke baad Screener dobara chalao.")
+max_stop_pct = stop_cap_pct / 100.0
 
 st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
@@ -2123,7 +2422,7 @@ tab_dash, tab_screener, tab_breakouts, tab_pull, tab_port, tab_market, tab_top =
 with tab_dash:
     result, status, error, source = analyze_stock(
         sidebar_ticker, period=period,
-        penny_threshold=penny_threshold, rvol_threshold=rvol_threshold)
+        penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, max_stop_pct=max_stop_pct)
     if status != "SUCCESS":
         st.error(f"❌ {sidebar_ticker} analyze nahi ho saka: {error}")
         with st.expander("🔍 Troubleshooting", expanded=True):
@@ -2206,8 +2505,13 @@ with tab_dash:
         st.subheader("📋 Trade Plan")
         risk = result["risk"]
         if is_bearish:
-            st.warning("📉 Bearish structure — long setup applicable nahi. "
-                       "Neeche 'Technical Projection' dekho (downside zone).")
+            st.warning("📉 Bearish structure — **long setup nahi**. Is tool mein sirf long (khareed) setups hain, "
+                       "isliye 'AVOID' ka matlab hai: naya paisa mat lagao. Agar yeh stock aap ke paas hai to "
+                       "Portfolio tab ka Recovery Planner dekho.")
+            st.caption("ℹ️ Short setup yahan nahi diya jata: aam retail investor ke liye PSX par short selling "
+                       "asaan/available option nahi hoti (futures ya broker ki facility par depend karta hai — "
+                       "broker se confirm karo). Neeche downside projection sirf yeh batata hai ke support kahan "
+                       "tak toot sakta hai.")
         elif risk.get("error"):
             st.warning(f"⚠️ Risk calculation error: {risk['error']}")
         else:
@@ -2217,8 +2521,23 @@ with tab_dash:
             c3.metric("Target 1", round(risk["target1"], 2))
             c4.metric("Target 2", round(risk["target2"], 2))
             c5.metric("R:R", f"1:{round(risk['rr1'], 2) if risk['rr1'] else 'N/A'}")
-            st.caption(f"🛑 Stop {risk.get('risk_pct', '?')}% neeche (entry se) · basis: {risk.get('stop_basis', '?')} · "
-                       f"limits: {STOP_MIN_ATR:g}–{STOP_MAX_ATR:g} ATR, max {int(STOP_MAX_PCT*100)}%")
+            st.caption(f"🛑 Stop entry se {risk.get('risk_pct', '?')}% neeche · basis: {risk.get('stop_basis', '?')} · "
+                       f"aap ka cap: {stop_cap_pct:g}% (sidebar) · "
+                       f"{round(risk['stop_atr'], 1) if risk.get('stop_atr') is not None else '?'} ATR door")
+            if risk.get("stop_noise"):
+                st.warning("🔔 Tight stop: stop 1 ATR se kam door hai — roz ki normal hilna-julna hi isay hit kar sakta hai "
+                           "(whipsaw). Cap barhao ya entry zone mein (neeche) lo.")
+            z1, z2, z3 = st.columns(3)
+            _dz = _fmt_zone(risk.get("dip_low"), risk.get("dip_high"))
+            _bz = _fmt_zone(risk.get("brk_low"), risk.get("brk_high"))
+            z1.metric("🔵 Buy on Dip (neeche aaye to)", _dz or "—",
+                      help="Price is range mein wapas aaye to entry. Basis: " + (risk.get("dip_note") or "n/a"))
+            z2.metric("🟣 Buy on Breakout (upar jaye to)", _bz or "—",
+                      help="Resistance ke upar volume ke saath close ho to entry.")
+            z3.metric("R:R inside zone",
+                      " / ".join([f"dip {risk['rr_dip']:.2f}" if risk.get("rr_dip") else "dip —",
+                                  f"brk {risk['rr_brk']:.2f}" if risk.get("rr_brk") else "brk —"]))
+            st.caption("Zone = range, ek point nahi. Stop/Target technical levels hain; zone ke andar R:R aksar abhi ke price se behtar hota hai.")
             if risk.get("conditional_entry") is not None:
                 st.caption(f"💡 Better Entry: {risk['conditional_entry']} — {risk['conditional_entry_note']}")
 
@@ -2236,11 +2555,16 @@ with tab_dash:
         show_bb = c1.checkbox("Bollinger Bands", value=False)
         show_sma200 = c2.checkbox("SMA200", value=False)
         show_sr = c3.checkbox("Support/Resistance", value=True)
-        show_rsi = c4.checkbox("RSI", value=False)
-        show_macd = c5.checkbox("MACD", value=False)
-        st.plotly_chart(build_chart(result, show_bb, show_sma200, show_sr, show_rsi, show_macd),
-            use_container_width=True)
-        st.caption("📉 **Projection line** follows trend direction. Technical estimate, not guarantee.")
+        show_zones = c4.checkbox("Buy zones", value=True)
+        show_rsi = c5.checkbox("RSI", value=False)
+        e1, e2 = st.columns([1, 3])
+        show_macd = e1.checkbox("MACD", value=False)
+        chart_bars = e2.select_slider("Chart window (trading days)", options=[60, 90, 120, 180, 250], value=120)
+        st.plotly_chart(build_chart(result, show_bb, show_sma200, show_sr, show_rsi, show_macd,
+                                    show_zones, chart_bars), use_container_width=True)
+        st.caption("📉 **Projection line** trend ki direction follow karti hai (technical estimate, guarantee nahi). "
+                   "🟥/🟩 shaded band = resistance/support **zone** (kitni baar price wahan se palta). "
+                   "🔵 Buy dip · 🟣 Buy breakout = entry ranges. Weekend/holiday gaps hata diye gaye hain.")
 
         with st.expander("📖 Indicator Explanations"):
             st.markdown(f"**SMA20:** {get_indicator_explanation('SMA20')} (Current: {round(last['SMA20'],2)})")
@@ -2274,6 +2598,16 @@ with tab_dash:
                 st.caption("⚠️ Secondary Support = Primary Support")
             if not sr.get("secondary_resistance_is_distinct", True):
                 st.caption("⚠️ Secondary Resistance = Primary Resistance")
+            _zrows = ([{"Type": f"Resistance {i+1}", "Level": round(z["level"], 2),
+                        "Band": f"{z['low']:.2f} – {z['high']:.2f}", "Basis": z.get("note", "")}
+                       for i, z in enumerate(sr.get("resistance_zones", []))]
+                      + [{"Type": f"Support {i+1}", "Level": round(z["level"], 2),
+                          "Band": f"{z['low']:.2f} – {z['high']:.2f}", "Basis": z.get("note", "")}
+                         for i, z in enumerate(sr.get("support_zones", []))])
+            if _zrows:
+                st.dataframe(pd.DataFrame(_zrows), hide_index=True, use_container_width=True)
+                st.caption("Zone = swing high/low ka cluster (touches = kitni baar price wahan se palta). "
+                           "Primary = price ke sabse qareeb wala zone.")
             if not pd.isna(sr["high_52w"]):
                 st.caption(f"52-Week High: {round(sr['high_52w'], 2)} | 52-Week Low: {round(sr['low_52w'], 2)}")
             else:
@@ -2292,6 +2626,7 @@ with tab_screener:
     with col1: custom_syms = st.text_input("Add extra symbols (comma-separated)", "")
     with col2: scan_full = st.checkbox("Scan full dynamic universe (slow, 500+ symbols, 10+ min)",
         value=False, help="Default scans first 100 symbols for speed")
+    st.caption(f"🛑 Stop cap abhi {stop_cap_pct:g}% hai (sidebar). Cap badlo to Screener dobara chalao, tab naye stops lagenge.")
     st.markdown("**Filters**")
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -2354,7 +2689,8 @@ with tab_screener:
         with st.spinner("Scanning PSX universe..."):
             market = market_snapshot()
             screener_df, coverage = run_screener(universe, period="1y",
-                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
+                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market,
+                max_stop_pct=max_stop_pct)
             st.session_state["screener_df"] = screener_df
             st.session_state["screener_coverage"] = coverage
             st.session_state["screener_universe_source"] = uni_source
@@ -2438,10 +2774,24 @@ with tab_screener:
 
 BREAKOUT_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
                  "Gate", "Confidence", "Status", "RVOL", "Resistance", "Dist %",
-                 "Entry", "Stop Loss", "Risk %", "Target 1", "RR", "RR Flag", "Penny", "Momentum", "52W", "Why"]
+                 "Entry", "Stop Loss", "Risk %", "Stop ATR", "Target 1", "RR", "RR Flag",
+                 "Buy on Dip", "RR @Dip", "Penny", "Momentum", "52W", "Why"]
 PULLBACK_COLS = ["Ticker", "Price", "Price Src", "Change %", "Trend", "Score", "Signal",
-                 "Gate", "Confidence", "Pullback", "EMA20", "Above EMA20 %", "Entry", "Stop Loss",
-                 "Risk %", "Target 1", "RR", "RR Flag", "RVOL", "Momentum", "Why"]
+                 "Pullback", "Pullback Checks", "EMA20", "Above EMA20 %", "RSI",
+                 "Buy on Dip", "RR @Dip", "Entry", "Stop Loss", "Risk %", "Target 1", "RR", "RR Flag",
+                 "RVOL", "Momentum", "Action"]
+
+def _pullback_action(row) -> str:
+    pb = str(row.get("Pullback", "")).upper()
+    dip = row.get("Buy on Dip")
+    zone = f" Dip zone: {dip}." if isinstance(dip, str) and dip else ""
+    sl = row.get("Stop Loss")
+    stop_txt = f" Stop {sl} ke neeche close = setup khatam." if sl is not None and not pd.isna(sl) else ""
+    if pb == "HEALTHY PULLBACK":
+        return "Confirmation mil gayi — entry dekh sakte ho." + zone + stop_txt
+    if pb == "PULLBACK WATCH":
+        return "Zone mein hai, confirmation baqi (RSI 35-55 + upar band hone wali candle)." + zone
+    return f"Abhi dip nahi aaya — EMA20 ({row.get('EMA20')}) tak girne ka intezar." + zone
 
 def _arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     """Columns mixing numbers and text (e.g. 'N/A') break st.dataframe's Arrow conversion."""
@@ -2506,7 +2856,7 @@ with tab_breakouts:
                         "RVOL kam karke dekho ya Screener ka universe/filters check karo.")
             else:
                 cols = [c for c in BREAKOUT_COLS if c in bo.columns]
-                st.dataframe(bo.sort_values("RVOL", ascending=False)[cols],
+                st.dataframe(_arrow_safe(bo.sort_values("RVOL", ascending=False)[cols]),
                              use_container_width=True, hide_index=True)
                 st.caption("Volume ke bina breakout aksar jhootha hota hai (false breakout) — "
                            "RVOL, Risk % aur RR Flag dekho. Entry/Stop/Target technical levels hain.")
@@ -2519,15 +2869,23 @@ with tab_pull:
     st.subheader("🔁 Pullbacks (Swing Entries)")
     st.caption("Bullish trend wale stocks jo EMA20 ya support ke qareeb wapas aaye hain. "
                "Breakout ka ulta idea: tez bhaag chuke stock ko chase karne ke bajaye dip pe entry.")
-    with st.expander("ℹ️ Pullback kya hota hai? (parhne ke liye)"):
+    with st.expander("ℹ️ Pullback kya hota hai? (parhne ke liye)", expanded=False):
         st.markdown(
-            "- **Pullback** = uptrend ke beech mein chhota sa girna (dip), jahan se trend dobara chal sakta hai.\n"
-            "- System isay tab pakadta hai jab: trend BULLISH ho, price **EMA20 ya support ke 2-3% ke andar** ho, "
-            "RSI thanda ho kar **35-55** mein aaye, aur aaj ki candle **upar band** ho (HEALTHY).\n"
-            "- **PULLBACK WATCH** = zone ke andar hai lekin RSI/candle ki confirmation baqi hai.\n"
-            "- Jo stock EMA20 se bohot upar hai (RSI 70+) wo **abhi pullback mein nahi** hai — usay chase karne "
-            "ke bajaye neeche 'Approaching' list mein dekho aur dip ka intezar karo.\n"
-            "- Stop Loss ke neeche close ho to setup khatam. Risk % se dekho ke stop kitna door hai.")
+            "**Pullback** = uptrend ke beech chhota sa girna (dip). Strong stock seedha nahi chadhta — "
+            "chadhta hai, thoda girta hai, phir chadhta hai. Is dip pe entry lene ka faida: **stop chhota** "
+            "(support/EMA20 paas hota hai) aur R:R behtar.\n\n"
+            "**System 4 cheezein check karta hai** (table ke 'Pullback Checks' column mein ✅/❌):\n"
+            "1. **Trend** BULLISH ya STRONG BULLISH ho\n"
+            "2. **Zone**: price EMA20 ya support ke 2-3% ke andar ho\n"
+            "3. **RSI** thanda ho kar 35-55 mein ho (jo bhaag chuka ho, RSI 70+ hota hai)\n"
+            "4. **Candle**: aaj ki candle upar band ho (khareedar wapas aaye)\n\n"
+            "- 4 mein se Trend+Zone ✅ aur RSI/Candle ✅ = **HEALTHY PULLBACK** (confirmation ke saath)\n"
+            "- Trend+Zone ✅ magar RSI/Candle ❌ = **PULLBACK WATCH** (dekho, abhi mat khareedo)\n"
+            "- Zone ❌ = abhi pullback nahi; 'Approaching' list mein EMA20 se 2-8% upar wale stocks hain, unka dip ka intezar\n\n"
+            "**Misaal (PRL):** pehle ~106.95 tak chadha, phir ~96.96 tak gira jo EMA20 (~96.5) ke qareeb hai — "
+            "yani Zone ✅. Candle upar band na ho ya RSI 55 se upar ho to WATCH rehta hai.\n\n"
+            "**'Buy on Dip'** column = woh range jahan entry behtar hai, **'RR @Dip'** = us range mein R:R. "
+            "Stop ke neeche close ho to setup khatam.")
     if "screener_df" not in st.session_state:
         st.info("Pehle Screener tab pe 'Run Screener' chalao.")
     else:
@@ -2547,8 +2905,9 @@ with tab_pull:
             if pb.empty:
                 st.info("Abhi koi stock pullback zone mein nahi hai. Bearish/sideways market mein yeh normal hai.")
             else:
+                pb = pb.copy(); pb["Action"] = pb.apply(_pullback_action, axis=1)
                 cols = [c for c in PULLBACK_COLS if c in pb.columns]
-                st.dataframe(pb.sort_values("Score", ascending=False)[cols],
+                st.dataframe(_arrow_safe(pb.sort_values("Score", ascending=False)[cols]),
                              use_container_width=True, hide_index=True)
             ab_x = pd.to_numeric(work["Above EMA20 %"], errors="coerce")
             appr = work[(pb_s == "NO PULLBACK") & bull & (ab_x > 2) & (ab_x <= 8)]
@@ -2556,11 +2915,83 @@ with tab_pull:
             if appr.empty:
                 st.caption("Koi stock is range mein nahi.")
             else:
+                appr = appr.assign(_x=ab_x[appr.index]).sort_values("_x")
+                appr["Action"] = appr.apply(_pullback_action, axis=1)
                 cols = [c for c in PULLBACK_COLS if c in appr.columns]
-                st.dataframe(appr.assign(_x=ab_x[appr.index]).sort_values("_x")[cols],
-                             use_container_width=True, hide_index=True)
-            st.caption("EMA20 = pullback ka nishana (isi ke paas entry dekhi jati hai). "
-                       "Entry/Stop/Target technical levels hain, guarantee nahi.")
+                st.dataframe(_arrow_safe(appr[cols]), use_container_width=True, hide_index=True)
+            st.caption("EMA20 = pullback ka nishana. Entry/Stop/Target technical levels hain, guarantee nahi.")
+
+
+def _render_recovery(plan: Dict, h: Dict, res: Dict, src_df):
+    t = res["ticker_display"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Loss (abhi)", f"PKR {plan['loss']:,.0f}")
+    c2.metric("Break-even ke liye", f"+{plan['need_pct']:.1f}%",
+              help="Abhi ke price se kitna badhna chahiye ke aap ki buy price wapas aa jaye")
+    c3.metric("Break-even price", f"{plan['buy']:.2f}")
+    c4.metric("Abhi price", f"{plan['price']:.2f}")
+    proj = res.get("projection", {})
+    if proj.get("direction") in ("UP", "DOWN"):
+        st.info(f"{'📈' if proj['direction'] == 'UP' else '📉'} Technical projection: {proj['label']} — {proj['note']}")
+
+    st.markdown("**1) Kaun se levels wapas lene hain** (neeche se upar)")
+    st.dataframe(pd.DataFrame(plan["levels"]), hide_index=True, use_container_width=True)
+    st.caption("'Loss recovered %' = us level tak pahunchne par aap ka kitna nuqsan wapas ho jata hai. "
+               "Har level par seller aate hain — price wahan ruk sakta hai.")
+
+    st.markdown("**2) Trend theek hone ki checklist**")
+    n_ok = sum(1 for _, ok, _ in plan["checks"] if ok)
+    for name, ok, val in plan["checks"]:
+        st.write(f"{'✅' if ok else '❌'} {name} — {val}")
+    st.caption(f"{n_ok}/{len(plan['checks'])} pass. Jab tak zyada points ❌ hain, system is stock ko recovery setup nahi maanta.")
+
+    st.markdown("**3) Time ka andaza (volatility se, prediction nahi)**")
+    parts = []
+    if plan["best_sessions"]:
+        d1 = plan["best_date"].strftime("%d-%b-%Y") if plan["best_date"] is not None else "bohot door"
+        parts.append(f"- **Best case** (price roz ek ATR seedha upar): ~{plan['best_sessions']:.0f} sessions → ~{d1}")
+    if plan["scale_sessions"]:
+        d2 = plan["scale_date"].strftime("%d-%b-%Y") if plan["scale_date"] is not None else "multi-year (1500+ sessions)"
+        parts.append(f"- **Volatility scale** (up-down chalte hue): ~{plan['scale_sessions']:.0f} sessions "
+                     f"(~{plan['scale_sessions'] / 21:.0f} mahine) → ~{d2}")
+    st.markdown("\n".join(parts) if parts else "Estimate ke liye data kam hai.")
+    st.caption("⚠️ Yeh sirf scale batata hai. Bearish trend mein recovery is se bohot lambi ho sakti hai ya na bhi ho. "
+               "Koi tarika exact date nahi bata sakta.")
+
+    st.markdown("**4) Options — rupees mein**")
+    opt = [{"Option": "Abhi poora exit", "Proceeds (PKR)": f"{plan['value']:,.0f}",
+            "Realized P/L (PKR)": f"{plan['pnl']:,.0f}", "Baqi shares": 0},
+           {"Option": "Aadha reduce", "Proceeds (PKR)": f"{plan['value'] / 2:,.0f}",
+            "Realized P/L (PKR)": f"{plan['pnl'] / 2:,.0f}", "Baqi shares": plan["shares"] // 2}]
+    if plan["further_to_stop"] is not None:
+        opt.append({"Option": f"Hold, stop {plan['active_stop']:.2f} pe", "Proceeds (PKR)": "—",
+                    "Realized P/L (PKR)": f"{-(plan['loss'] + plan['further_to_stop']):,.0f} (stop hit hone par)",
+                    "Baqi shares": plan["shares"]})
+    else:
+        opt.append({"Option": "Hold", "Proceeds (PKR)": "—",
+                    "Realized P/L (PKR)": "stop pehle hi toot chuka / data nahi", "Baqi shares": plan["shares"]})
+    st.dataframe(pd.DataFrame(opt), hide_index=True, use_container_width=True)
+    st.caption("Brokerage/tax shamil nahi. Faisla aap ka hai — system sirf numbers dikhata hai.")
+
+    st.markdown("**5) Average karne ka hisaab**")
+    add = st.number_input(f"Agar {t} mein aur lagao (PKR)", min_value=0, value=0, step=10000, key=f"avg_{t}")
+    if add > 0:
+        new_sh = add / plan["price"]; tot_sh = plan["shares"] + new_sh
+        new_avg = (plan["invested"] + add) / tot_sh
+        need2 = (new_avg / plan["price"] - 1) * 100
+        st.write(f"Nayi average price **{new_avg:.2f}** → break-even ke liye **+{need2:.1f}%** "
+                 f"(pehle +{plan['need_pct']:.1f}%). Lekin exposure PKR {add:,.0f} barh jata hai.")
+        st.caption("Bearish trend mein average-down se risk barhta hai; checklist ke zyada points ✅ hone tak sirf hisaab dekho.")
+
+    st.markdown("**6) Switch ka hisaab (latest scan ke bullish candidates)**")
+    sw = switch_candidates(src_df, [t], plan["need_pct"])
+    if sw.empty:
+        st.caption("Pehle Screener ya Top Picks chalao — phir yahan candidates aur 'recover karne ke liye kitne successful trades' dikhenge.")
+    else:
+        st.dataframe(_arrow_safe(sw), hide_index=True, use_container_width=True)
+        st.caption(f"'Wins to recover' = {plan['value']:,.0f} PKR ko {plan['invested']:,.0f} tak wapas lane ke liye "
+                   f"candidate ke Target 1 jitne kitne kamyab trades chahiye (har trade apne stop/risk ke saath). "
+                   f"Loss realize hota hai aur candidate ke bhi fail hone ka imkaan hai — yeh sirf arithmetic hai.")
 
 # ============================================================
 # PORTFOLIO TAB
@@ -2590,10 +3021,12 @@ with tab_port:
                 st.success(f"Added {h_ticker}")
     if st.session_state.portfolio:
         rows = []; total_invested = 0; total_current = 0
+        plan_inputs = []
         market = market_snapshot()
         for h in st.session_state.portfolio:
             result, status, error, _ = analyze_stock(h["ticker"], period="1y",
-                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
+                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market,
+                max_stop_pct=max_stop_pct)
             invested = h["buy_price"] * h["shares"]
             total_invested += invested
             if status == "SUCCESS" and result is not None:
@@ -2613,6 +3046,7 @@ with tab_port:
                     active_stop = technical_stop
                 else:
                     active_stop = None
+                plan_inputs.append((h, result, active_stop))
                 fresh_status, _, _ = get_freshness_status(result["data_date"])
                 data_date_str = result["data_date"].strftime("%Y-%m-%d") if result["data_date"] is not None else "N/A"
                 price_src = _price_src_label(result)
@@ -2628,6 +3062,8 @@ with tab_port:
                     "Technical Stop": round(technical_stop, 2) if technical_stop else "N/A",
                     "Active Stop": round(active_stop, 2) if active_stop else "N/A",
                     "Target 1": round(result["risk"]["target1"], 2) if result["risk"]["target1"] else "N/A",
+                    "Break-even +%": round((h["buy_price"] / cur_price - 1) * 100, 1) if cur_price < h["buy_price"] else 0.0,
+                    "Projection": result["projection"]["label"],
                     "Data Date": data_date_str, "Freshness": fresh_status,
                     "Decision": decision, "Reason": reason})
             else:
@@ -2668,6 +3104,23 @@ with tab_port:
             st.dataframe(port_df, use_container_width=True, hide_index=True)
         st.caption("**Freshness:** FRESH = 0-1 business days · DELAYED = 2-3 · "
                    "STALE = >3 (pink highlight). **Confidence:** ✅ HIGH / ⚠️ MEDIUM / ❌ LOW")
+        if plan_inputs:
+            st.markdown("### 🩺 Recovery Planner")
+            st.caption("Har losing holding ke liye facts + hisaab: kaun se levels wapas lene hain, trend kab theek hoga, "
+                       "time ka andaza, exit/hold ke rupee outcomes. Yeh advice nahi, numbers hain — faisla aap ka.")
+            _src_df = st.session_state.get("screener_df")
+            if _src_df is None or getattr(_src_df, "empty", True):
+                _src_df = st.session_state.get("top_picks_df")
+            for _h, _res, _astop in plan_inputs:
+                _plan = recovery_plan(_h, _res, _astop)
+                _tk = _res["ticker_display"]
+                if _plan is None:
+                    with st.expander(f"✅ {_tk} — profit mein"):
+                        st.success("Profit mein hai. Recovery ki zaroorat nahi — Active Stop ko upar trail karne ka sochen.")
+                else:
+                    with st.expander(f"🩺 {_tk} — loss PKR {_plan['loss']:,.0f} · break-even +{_plan['need_pct']:.1f}% "
+                                     f"· {_res['trend']} · {_res['signal']['signal']}"):
+                        _render_recovery(_plan, _h, _res, _src_df)
         remove_idx = st.selectbox("Remove holding",
             options=["-"] + [h["ticker"] for h in st.session_state.portfolio])
         if remove_idx != "-" and st.button("Remove Selected"):
@@ -2789,7 +3242,8 @@ with tab_top:
                 uni = uni[:100]
             market = market_snapshot()
             top_picks_df, _ = run_screener(uni, period="1y",
-                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market)
+                penny_threshold=penny_threshold, rvol_threshold=rvol_threshold, market=market,
+                max_stop_pct=max_stop_pct)
             st.session_state["top_picks_df"] = top_picks_df
     if "top_picks_df" not in st.session_state:
         st.info("Click **Generate Top Picks** to scan.")
@@ -2800,6 +3254,9 @@ with tab_top:
         else:
             picks = categorize_top_picks(df_s, penny_threshold=penny_threshold,
                 rvol_threshold=rvol_threshold)
+            if picks.get("moved"):
+                st.caption("ℹ️ Har stock sirf ek category mein (Hold > Swing > Day). Day se hataye: "
+                           + ", ".join(sorted(set(picks["moved"]))))
             st.markdown("### ⚡ Day Trade Candidates")
             st.caption("High momentum + breakout structure — 1-2 sessions. "
                        "⚠️ Low R:R = reward:risk < 1.0 (momentum play, not R:R play).")
@@ -2809,9 +3266,10 @@ with tab_top:
                 day_cols = ["Ticker", "Price", "Price Src", "Change %", "Score", "Signal",
                             "Gate", "Confidence", "Status",
                             "Entry", "Stop Loss", "Risk %", "Target 1",
+                            "Buy on Dip", "RR @Dip", "Buy on Breakout",
                             "RR", "RR Flag", "Hold Estimate", "Basis"]
                 day_cols = [c for c in day_cols if c in picks["day"].columns]
-                st.dataframe(picks["day"][day_cols], use_container_width=True, hide_index=True)
+                st.dataframe(_arrow_safe(picks["day"][day_cols]), use_container_width=True, hide_index=True)
             st.divider()
             st.markdown("### 🌊 Swing Trade Candidates")
             st.caption("Clear trend + room to run + R:R ≥ 1.5 — 5-15 sessions")
@@ -2821,9 +3279,10 @@ with tab_top:
                 swing_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
                               "Gate", "Confidence", "Status",
                               "Entry", "Stop Loss", "Risk %", "Target 1",
+                              "Buy on Dip", "RR @Dip", "Buy on Breakout",
                               "RR", "Hold Estimate", "Basis"]
                 swing_cols = [c for c in swing_cols if c in picks["swing"].columns]
-                st.dataframe(picks["swing"][swing_cols], use_container_width=True, hide_index=True)
+                st.dataframe(_arrow_safe(picks["swing"][swing_cols]), use_container_width=True, hide_index=True)
             st.divider()
             st.markdown("### 💼 Hold Candidates")
             st.caption("Established strong bullish trend — positional horizon")
@@ -2833,9 +3292,10 @@ with tab_top:
                 hold_cols = ["Ticker", "Price", "Price Src", "Trend", "Score", "Signal",
                              "Gate", "Confidence", "Status",
                              "Entry", "Stop Loss", "Risk %", "Target 1",
+                             "Buy on Dip", "RR @Dip", "Buy on Breakout",
                              "RR", "Hold Estimate", "Basis"]
                 hold_cols = [c for c in hold_cols if c in picks["hold"].columns]
-                st.dataframe(picks["hold"][hold_cols], use_container_width=True, hide_index=True)
+                st.dataframe(_arrow_safe(picks["hold"][hold_cols]), use_container_width=True, hide_index=True)
             st.caption("**Hold Estimate** = ATR-based pace calculation. Technical estimate, guaranteed nahi. "
                        "**Entry/Stop/Target 1** = long trade plan levels (skip if bearish).")
 
