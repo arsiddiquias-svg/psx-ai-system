@@ -790,10 +790,10 @@ def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) 
 # SCAN UNIVERSE
 # ============================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
 # ex-dividend / non-convertible / rights lines (e.g. HUMNLXD, PASLNC, BAPLR1): no /historical table on PSX
 _DERIVED_SYMBOL_RE = re.compile(r"^[A-Z]{3,}(XD|NC|NCXD)$|^[A-Z]{3,}R\d+$")
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_scan_universe() -> Tuple[List[str], str]:
     mw, status, _ = fetch_psx_official_market_watch()
     if status == "SUCCESS" and mw is not None and len(mw) > 100:
