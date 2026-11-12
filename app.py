@@ -1,7 +1,17 @@
 """
-PSX QUANT ENGINE - v9.0
+PSX QUANT ENGINE - v9.0.1
 ==========================
 PSX-focused quantitative decision-support terminal.
+
+CHANGELOG v9.0.1 (fixes found from live screenshots of v9.0):
+- LIVE PRICE BUG: before the market opens PSX rolls LDCP to yesterday's close but leaves yesterday's
+  CHANGE on the board, so LDCP+CHANGE double-counted the last move (PRL showed 83.52 instead of 80.39;
+  Screener Price != Entry by exactly the day's change). Live price is now trusted only inside PSX
+  session hours AND only when it is consistent with the last close; otherwise last PSX close is shown.
+- Header change % now matches the displayed price; Trade Plan notes when live differs from plan base.
+- PULLBACK: a pullback now needs price >= 3% off its 10-day high and <= 6% above EMA20 for the
+  support case (v9.0's nearer pivot supports made almost every stock a "pullback").
+- Chart: Target and Resistance lines that coincide are merged; zones > 30% from price are hidden.
 
 CHANGELOG v9.0 (live-screenshot review, phase 2):
 - STOP LOSS: user-controlled "Max Stop Loss %" slider (2-10%, default 5%). Stop = nearest
@@ -93,7 +103,7 @@ from typing import Optional, Tuple, Dict, Any, List, Union
 # ============================================================
 
 st.set_page_config(
-    page_title="PSX Quant Engine v9.0",
+    page_title="PSX Quant Engine v9.0.1",
     page_icon="📈",
     layout="wide"
 )
@@ -768,7 +778,19 @@ def _price_src_label(result: Dict) -> str:
         return "📅 PSX EOD"
     return "📅 yf"
 
+def _psx_session_open(now=None) -> bool:
+    """Weekday 09:15-17:00 PKT (covers the Friday split session). Holidays are not detected."""
+    now = now or pkt_now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.hour * 60 + now.minute
+    return 9 * 60 + 15 <= hm <= 17 * 60
+
 def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Board price = LDCP + CHANGE. Outside the session PSX rolls LDCP to the last close but keeps the
+    previous day's CHANGE, which would double-count it - so a board price is only returned when
+    (a) the session is open, (b) the change is plausible (<= ~10.5% of LDCP) and (c) it differs from
+    the last close. If it equals the last close there is nothing live to show (None)."""
     try:
         mw, status, _ = fetch_psx_official_market_watch()
         if status != "SUCCESS" or mw is None:
@@ -778,10 +800,19 @@ def get_live_psx_price(ticker: str, yf_reference_price: Optional[float] = None) 
         if row.empty or pd.isna(row.iloc[0].get("Current")):
             return None
         psx_price = float(row.iloc[0]["Current"])
+        ldcp = row.iloc[0].get("LDCP")
         if yf_reference_price is not None and yf_reference_price > 0:
             ratio = psx_price / yf_reference_price
             if ratio > 1.20 or ratio < 0.80:     # >20% off the last close = mis-parse, not a price
                 return None
+            tol = max(0.015, 0.0005 * yf_reference_price)
+            if abs(psx_price - yf_reference_price) <= tol:
+                return None                       # same as last close: nothing live
+        if ldcp is not None and not pd.isna(ldcp) and float(ldcp) > 0:
+            if abs(psx_price - float(ldcp)) / float(ldcp) > 0.105:
+                return None                       # beyond PSX circuit limits: stale/garbled
+        if not _psx_session_open():
+            return None                           # pre-open / after-hours / weekend: CHANGE may be stale
         return {"price": psx_price, "date": pkt_now().date(), "source": "psx_official_live"}
     except Exception:
         return None
@@ -1336,8 +1367,14 @@ def pullback_engine(d, trend, sr):
     last = d.iloc[-1]; support = sr["primary_support"]; price = last["Close"]
     if trend not in ("BULLISH", "STRONG BULLISH"):
         return {"status": "NO PULLBACK", "note": "Trend is not bullish"}
-    near_support = abs(price - support) / price < 0.03 if price > 0 else False
-    near_ema20 = abs(price - last["EMA20"]) / price < 0.02 if not pd.isna(last["EMA20"]) and price > 0 else False
+    ema20_v = last["EMA20"]
+    above_ema = (price / ema20_v - 1) if (not pd.isna(ema20_v) and ema20_v > 0) else None
+    high10 = d["High"].tail(10).max()
+    off_high = (1 - price / high10) if high10 > 0 else 0
+    # v9.0.1: support case needs a real dip (>=3% off the 10d high) and price not far above EMA20
+    near_support = (abs(price - support) / price < 0.03 and off_high >= 0.03
+                    and (above_ema is None or above_ema <= 0.06)) if price > 0 else False
+    near_ema20 = abs(price - ema20_v) / price < 0.02 if not pd.isna(ema20_v) and price > 0 else False
     cooling_rsi = 35 <= last["RSI14"] <= 55
     bullish_candle = last["Close"] > last["Open"]
     if price < support * 0.98: return {"status": "BROKEN SUPPORT", "note": "Closed below primary support"}
@@ -2163,6 +2200,8 @@ def build_chart(result, show_bb=False, show_sma200=False,
                                  name="BB Lower"), row=row, col=1)
 
     def _visible(lo, hi):
+        if abs(((lo + hi) / 2) / price_now - 1) > 0.30:      # far zones only add clutter
+            return False
         return not (hi < y_lo - pad or lo > y_hi + pad)
 
     if show_support_resistance:
@@ -2173,7 +2212,7 @@ def build_chart(result, show_bb=False, show_sma200=False,
             fig.add_hrect(y0=z["low"], y1=z["high"], fillcolor="#F23645", opacity=0.13 if i == 0 else 0.07,
                           line_width=0, row=row, col=1)
             fig.add_hline(y=z["level"], line_color="#D62839", line_width=1.5 if i == 0 else 1, line_dash="dash",
-                          annotation_text=f"R{i+1} {z['level']:.2f} · {z.get('note','')}",
+                          annotation_text=f"R{i+1}{'/T1' if (i == 0 and risk.get('target1') and abs(risk['target1'] / z['level'] - 1) < 0.005 and not is_bear) else ''} {z['level']:.2f} · {z.get('note','')}",
                           annotation_position="top right", annotation_font_size=10,
                           annotation_font_color="#D62839", row=row, col=1)
         _sz = sr.get("support_zones", [])[:2]
@@ -2203,7 +2242,9 @@ def build_chart(result, show_bb=False, show_sma200=False,
                           annotation_text=f"Stop {risk['stop_loss']:.2f} (-{risk.get('risk_pct','?')}%)",
                           annotation_position="bottom left", annotation_font_size=10,
                           annotation_font_color="#EA580C", row=row, col=1)
-        if risk.get("target1") and _visible(risk["target1"], risk["target1"]):
+        _r1 = (sr.get("resistance_zones") or [{}])[0].get("level") if show_support_resistance else None
+        _t1_dup = _r1 is not None and abs(risk["target1"] / _r1 - 1) < 0.005 if risk.get("target1") else False
+        if risk.get("target1") and not _t1_dup and _visible(risk["target1"], risk["target1"]):
             fig.add_hline(y=risk["target1"], line_dash="dot", line_color="#2563EB", line_width=1.6,
                           annotation_text=f"T1 {risk['target1']:.2f}", annotation_position="top left",
                           annotation_font_size=10, annotation_font_color="#1D4ED8", row=row, col=1)
@@ -2328,7 +2369,7 @@ st.sidebar.markdown(
     "<div style='font-family:monospace; color:#2563EB; font-size:22px; "
     "font-weight:bold; letter-spacing:1px;'>PSX QUANT ENGINE</div>"
     "<div style='color:#64748B; font-size:11px; margin-bottom:10px;'>"
-    "Quantitative Decision Support · v9.0</div>", unsafe_allow_html=True)
+    "Quantitative Decision Support · v9.0.1</div>", unsafe_allow_html=True)
 
 _prov_slot = st.sidebar.container()   # v8.9: filled at the END of the script, after all fetches
 
@@ -2453,7 +2494,11 @@ with tab_dash:
             st.markdown(f"<span class='current-price'>{round(disp_price, 2)}</span>",
                 unsafe_allow_html=True)
             prev_close = result["df"]["Close"].iloc[-2] if len(result["df"]) >= 2 else last["Close"]
-            change = last["Close"] - prev_close
+            if result["display_price_source"] == "psx_official_live":
+                prev_close = last["Close"]                 # today's move is vs the last close
+                change = disp_price - prev_close
+            else:
+                change = last["Close"] - prev_close
             change_pct = (change / prev_close * 100) if prev_close else 0
             cc = "change-positive" if change >= 0 else "change-negative"
             st.markdown(f"<span class='{cc}'>{'▲' if change >= 0 else '▼'} "
@@ -2537,6 +2582,12 @@ with tab_dash:
             z3.metric("R:R inside zone",
                       " / ".join([f"dip {risk['rr_dip']:.2f}" if risk.get("rr_dip") else "dip —",
                                   f"brk {risk['rr_brk']:.2f}" if risk.get("rr_brk") else "brk —"]))
+            _dp = result.get("display_price")
+            if (result.get("display_price_source") == "psx_official_live" and _dp
+                    and abs(_dp / risk["entry"] - 1) > 0.005):
+                st.warning(f"ℹ️ Plan last close {risk['entry']:.2f} par bana hai, live price {_dp:.2f} "
+                           f"({(_dp / risk['entry'] - 1) * 100:+.1f}%) hai — entry/stop/R:R live price ke hisaab se "
+                           f"dobara dekho, zone se door ho to chase mat karo.")
             st.caption("Zone = range, ek point nahi. Stop/Target technical levels hain; zone ke andar R:R aksar abhi ke price se behtar hota hai.")
             if risk.get("conditional_entry") is not None:
                 st.caption(f"💡 Better Entry: {risk['conditional_entry']} — {risk['conditional_entry_note']}")
